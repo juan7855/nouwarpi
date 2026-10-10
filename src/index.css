@@ -7,7 +7,7 @@
   --dark: #808080;
   --darkest: #0a0a0a;
   --navy: #000080;
-  --teal: #008080;
+  --teal: #000000;
 }
 
 * {
@@ -504,7 +504,7 @@ body {
   font-weight: bold;
   font-size: 34px;
   letter-spacing: 1px;
-  text-shadow: 2px 2px 0 #000040;
+  text-shadow: 2px 2px 0 #000080;
   user-select: none;
 }
 

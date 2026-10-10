@@ -581,7 +581,7 @@ export default function App() {
     : 0;
 
   return (
-    <div className="min-h-screen pb-12">
+    <div className="min-h-screen pb-16">
       <input
         ref={fileInputRef}
         type="file"
@@ -597,7 +597,7 @@ export default function App() {
       {/* encabezado */}
       <header className="px-4 pt-4 pb-1 flex flex-wrap items-end gap-x-6 gap-y-2">
         <div>
-          <div className="desktop-title">EL PRIMER GOLPE</div>
+          <div className="desktop-title">nouwarpi</div>
           <div className="desktop-sub">
             Alinea tu audio al tempo del proyecto · 100% en tu navegador · WAV
             24/32 bits sin pérdida
@@ -1143,7 +1143,7 @@ export default function App() {
           >
             <div className="flex flex-col gap-2">
               <div style={{ fontWeight: "bold", fontSize: 13 }}>
-                EL PRIMER GOLPE v1.0
+                nouwarpi v1.0
               </div>
               <div className="w95-label">
                 Carga un audio, coloca el marcador en el primer golpe real,
@@ -1161,8 +1161,8 @@ export default function App() {
 
       {/* barra de estado */}
       <footer
-        className="fixed bottom-0 left-0 right-0 z-50"
-        style={{ background: "#c0c0c0" }}
+        className="fixed bottom-0 left-0 right-0"
+        style={{ background: "#c0c0c0", zIndex: 200 }}
       >
         <div className="w95-statusbar">
           <div className="w95-status-panel" style={{ flex: "1 1 auto", minWidth: 120 }}>
