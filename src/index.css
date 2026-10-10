@@ -1,0 +1,548 @@
+@import "tailwindcss";
+
+:root {
+  --face: #c0c0c0;
+  --light: #dfdfdf;
+  --lightest: #ffffff;
+  --dark: #808080;
+  --darkest: #0a0a0a;
+  --navy: #000080;
+  --teal: #008080;
+}
+
+* {
+  transition: none !important;
+  animation: none !important;
+  scroll-behavior: auto !important;
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  min-height: 100%;
+}
+
+body {
+  background-color: var(--teal);
+  font-family: Tahoma, Verdana, "Segoe UI", sans-serif;
+  font-size: 11px;
+  color: #000000;
+  -webkit-font-smoothing: none;
+  overflow-x: hidden;
+}
+
+.mono {
+  font-family: "Courier New", Courier, monospace;
+}
+
+/* ---------- biseles clásicos ---------- */
+
+.w95-outset {
+  background: var(--face);
+  box-shadow:
+    inset -1px -1px var(--darkest),
+    inset 1px 1px var(--lightest),
+    inset -2px -2px var(--dark),
+    inset 2px 2px var(--light);
+}
+
+.w95-inset {
+  background: var(--face);
+  box-shadow:
+    inset -1px -1px var(--lightest),
+    inset 1px 1px var(--darkest),
+    inset -2px -2px var(--light),
+    inset 2px 2px var(--dark);
+}
+
+/* ---------- ventana ---------- */
+
+.w95-window {
+  background: var(--face);
+  box-shadow:
+    inset -1px -1px var(--darkest),
+    inset 1px 1px var(--lightest),
+    inset -2px -2px var(--dark),
+    inset 2px 2px var(--light);
+  padding: 3px;
+  user-select: none;
+}
+
+.w95-titlebar {
+  background: var(--navy);
+  color: #ffffff;
+  font-weight: bold;
+  font-size: 11px;
+  padding: 2px 2px 2px 4px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  cursor: default;
+  touch-action: none;
+}
+
+.w95-titlebar-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  letter-spacing: 0.2px;
+}
+
+.w95-titlebar-btns {
+  display: flex;
+  gap: 2px;
+}
+
+.w95-tb-btn {
+  width: 16px;
+  height: 14px;
+  background: var(--face);
+  color: #000;
+  font-size: 9px;
+  line-height: 1;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow:
+    inset -1px -1px var(--darkest),
+    inset 1px 1px var(--lightest),
+    inset -2px -2px var(--dark),
+    inset 2px 2px var(--light);
+  border: none;
+  cursor: pointer;
+}
+
+.w95-tb-btn:active {
+  box-shadow:
+    inset -1px -1px var(--lightest),
+    inset 1px 1px var(--darkest),
+    inset -2px -2px var(--light),
+    inset 2px 2px var(--dark);
+}
+
+.w95-window-body {
+  padding: 6px;
+}
+
+/* ---------- botón ---------- */
+
+.w95-btn {
+  background: var(--face);
+  color: #000;
+  font-family: Tahoma, Verdana, sans-serif;
+  font-size: 11px;
+  padding: 3px 12px;
+  min-height: 23px;
+  box-shadow:
+    inset -1px -1px var(--darkest),
+    inset 1px 1px var(--lightest),
+    inset -2px -2px var(--dark),
+    inset 2px 2px var(--light);
+  border: none;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.w95-btn:active:not(:disabled) {
+  box-shadow:
+    inset -1px -1px var(--lightest),
+    inset 1px 1px var(--darkest),
+    inset -2px -2px var(--light),
+    inset 2px 2px var(--dark);
+  padding-top: 4px;
+  padding-bottom: 2px;
+}
+
+.w95-btn:disabled {
+  color: #808080;
+  text-shadow: 1px 1px 0 #ffffff;
+  cursor: default;
+}
+
+.w95-btn:focus-visible {
+  outline: 1px dotted #000;
+  outline-offset: -4px;
+}
+
+/* ---------- campos ---------- */
+
+.w95-field {
+  background: #ffffff;
+  font-family: Tahoma, Verdana, sans-serif;
+  font-size: 11px;
+  padding: 2px 4px;
+  border: none;
+  box-shadow:
+    inset -1px -1px var(--lightest),
+    inset 1px 1px var(--darkest),
+    inset -2px -2px var(--light),
+    inset 2px 2px var(--dark);
+  color: #000;
+  outline: none;
+}
+
+.w95-num {
+  font-family: "Courier New", Courier, monospace;
+  width: 76px;
+  text-align: right;
+}
+
+.w95-select {
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 18px;
+  background-image: none;
+  cursor: pointer;
+}
+
+.w95-select-wrap {
+  position: relative;
+  display: inline-block;
+}
+
+.w95-select-wrap::after {
+  content: "";
+  position: absolute;
+  right: 5px;
+  top: 50%;
+  width: 0;
+  height: 0;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 5px solid #000000;
+  transform: translateY(-50%);
+  pointer-events: none;
+}
+
+.w95-field:disabled {
+  background: #e0e0e0;
+  color: #808080;
+}
+
+.w95-field-text {
+  display: inline-block;
+  padding: 2px 6px;
+  font-family: "Courier New", Courier, monospace;
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ---------- casilla ---------- */
+
+.w95-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  user-select: none;
+  padding: 2px 0;
+  position: relative;
+}
+
+.w95-box {
+  width: 13px;
+  height: 13px;
+  background: #ffffff;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow:
+    inset -1px -1px var(--lightest),
+    inset 1px 1px var(--darkest),
+    inset -2px -2px var(--light),
+    inset 2px 2px var(--dark);
+  flex: 0 0 auto;
+}
+
+.w95-checkmark {
+  font-size: 11px;
+  font-weight: bold;
+  line-height: 1;
+  color: #000;
+  margin-top: -1px;
+}
+
+.w95-disabled {
+  color: #808080;
+  text-shadow: 1px 1px 0 #ffffff;
+  cursor: default;
+}
+
+/* ---------- radio ---------- */
+
+.w95-radio {
+  width: 12px;
+  height: 12px;
+  background: #ffffff;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow:
+    inset -1px -1px var(--lightest),
+    inset 1px 1px var(--darkest),
+    inset -2px -2px var(--light),
+    inset 2px 2px var(--dark);
+  flex: 0 0 auto;
+}
+
+.w95-radio-dot {
+  width: 6px;
+  height: 6px;
+  background: #000;
+  border-radius: 50%;
+}
+
+/* ---------- barra de progreso de bloques ---------- */
+
+.w95-progress {
+  background: #ffffff;
+  height: 14px;
+  display: flex;
+  align-items: stretch;
+  gap: 1px;
+  padding: 1px;
+  box-shadow:
+    inset -1px -1px var(--lightest),
+    inset 1px 1px var(--darkest),
+    inset -2px -2px var(--light),
+    inset 2px 2px var(--dark);
+}
+
+.w95-progress-block {
+  flex: 1 1 0;
+  background: #ffffff;
+}
+
+.w95-progress-block.w95-progress-on {
+  background: var(--navy);
+}
+
+/* ---------- barra de estado ---------- */
+
+.w95-statusbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  padding: 2px;
+}
+
+.w95-status-panel {
+  background: var(--face);
+  box-shadow:
+    inset -1px -1px var(--lightest),
+    inset 1px 1px var(--dark),
+    inset -2px -2px var(--light),
+    inset 2px 2px #404040;
+  padding: 2px 6px;
+  font-size: 11px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+/* ---------- zona de carga ---------- */
+
+.w95-dropzone {
+  background: #ffffff;
+  box-shadow:
+    inset -1px -1px var(--lightest),
+    inset 1px 1px var(--darkest),
+    inset -2px -2px var(--light),
+    inset 2px 2px var(--dark);
+  min-height: 64px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 10px;
+  text-align: center;
+  cursor: pointer;
+}
+
+.w95-dropzone.w95-drop-hover {
+  background: #000080;
+  color: #ffffff;
+}
+
+/* ---------- forma de onda ---------- */
+
+.wave-wrap {
+  position: relative;
+  width: 100%;
+  background: #000000;
+  box-shadow:
+    inset -1px -1px var(--lightest),
+    inset 1px 1px var(--darkest),
+    inset -2px -2px var(--light),
+    inset 2px 2px var(--dark);
+  overflow: hidden;
+  cursor: crosshair;
+  touch-action: none;
+}
+
+.wave-wrap canvas {
+  display: block;
+  touch-action: none;
+}
+
+/* ---------- barra de desplazamiento clásica ---------- */
+
+.w95-hscroll {
+  height: 16px;
+  background: var(--face);
+  display: flex;
+  align-items: center;
+  padding: 0 2px;
+  gap: 2px;
+  box-shadow:
+    inset -1px -1px var(--lightest),
+    inset 1px 1px var(--darkest),
+    inset -2px -2px var(--light),
+    inset 2px 2px var(--dark);
+  user-select: none;
+}
+
+.w95-scroll-btn {
+  width: 14px;
+  height: 14px;
+  background: var(--face);
+  font-size: 8px;
+  line-height: 1;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow:
+    inset -1px -1px var(--darkest),
+    inset 1px 1px var(--lightest),
+    inset -2px -2px var(--dark),
+    inset 2px 2px var(--light);
+  border: none;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+
+.w95-scroll-btn:active {
+  box-shadow:
+    inset -1px -1px var(--lightest),
+    inset 1px 1px var(--darkest),
+    inset -2px -2px var(--light),
+    inset 2px 2px var(--dark);
+}
+
+.w95-scroll-track {
+  flex: 1 1 auto;
+  height: 14px;
+  background: var(--face);
+  position: relative;
+  box-shadow:
+    inset -1px -1px var(--lightest),
+    inset 1px 1px var(--darkest),
+    inset -2px -2px var(--light),
+    inset 2px 2px var(--dark);
+  cursor: pointer;
+}
+
+.w95-scroll-thumb {
+  position: absolute;
+  top: 1px;
+  height: 12px;
+  background: var(--face);
+  box-shadow:
+    inset -1px -1px var(--darkest),
+    inset 1px 1px var(--lightest),
+    inset -2px -2px var(--dark),
+    inset 2px 2px var(--light);
+  cursor: pointer;
+}
+
+/* ---------- textos ---------- */
+
+.w95-label {
+  font-size: 11px;
+  user-select: none;
+}
+
+.w95-group-title {
+  font-weight: bold;
+  font-size: 11px;
+  margin-bottom: 2px;
+  user-select: none;
+}
+
+.w95-warn {
+  color: #c00000;
+  font-weight: bold;
+  font-size: 11px;
+  user-select: none;
+}
+
+.w95-ok {
+  color: #006400;
+  font-size: 11px;
+}
+
+/* ---------- escritorio ---------- */
+
+.desktop-title {
+  color: #ffffff;
+  font-weight: bold;
+  font-size: 34px;
+  letter-spacing: 1px;
+  text-shadow: 2px 2px 0 #000040;
+  user-select: none;
+}
+
+.desktop-sub {
+  color: #e0e0e0;
+  font-size: 11px;
+  user-select: none;
+}
+
+.visit-digit {
+  background: #000000;
+  color: #00ff00;
+  font-family: "Courier New", Courier, monospace;
+  font-weight: bold;
+  font-size: 14px;
+  padding: 1px 4px;
+  box-shadow:
+    inset -1px -1px var(--lightest),
+    inset 1px 1px var(--darkest),
+    inset -2px -2px var(--light),
+    inset 2px 2px var(--dark);
+}
+
+.menu-item {
+  padding: 3px 10px;
+  cursor: pointer;
+  user-select: none;
+  color: #000;
+}
+
+.menu-item:hover {
+  background: var(--navy);
+  color: #ffffff;
+}
+
+/* ---------- móvil: ventanas apiladas ---------- */
+
+@media (max-width: 819px) {
+  .desktop-title {
+    font-size: 24px;
+  }
+  .w95-window-body {
+    padding: 5px;
+  }
+}
