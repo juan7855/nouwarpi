@@ -173,7 +173,6 @@ export default function App() {
       window.removeEventListener("resize", fit);
     };
   }, []);
-  const [visits, setVisits] = useState(1);
   const [aboutOpen, setAboutOpen] = useState(false);
   const [dropHover, setDropHover] = useState(false);
   const [tapCount, setTapCount] = useState(0);
@@ -561,19 +560,6 @@ export default function App() {
     }
   }, [file, exportPlan, factor, keepPitch, pad, bitDepth]);
 
-  /* ---------- contador de visitas ---------- */
-
-  useEffect(() => {
-    let v = 1;
-    try {
-      v = parseInt(localStorage.getItem("pg-visits") ?? "0", 10) + 1;
-      localStorage.setItem("pg-visits", String(v));
-    } catch {
-      /* noop */
-    }
-    setVisits(v);
-  }, []);
-
   /* ---------- render ---------- */
 
   const cursorBar = file
@@ -598,21 +584,6 @@ export default function App() {
       <header className="px-4 pt-4 pb-1 flex flex-wrap items-end gap-x-6 gap-y-2">
         <div>
           <div className="desktop-title">nouwarpi</div>
-          <div className="desktop-sub">
-            Alinea tu audio al tempo del proyecto · 100% en tu navegador · WAV
-            24/32 bits sin pérdida
-          </div>
-        </div>
-        <div className="flex items-center gap-1 ml-auto">
-          <span className="desktop-sub mr-1">Nº de visita:</span>
-          {String(visits)
-            .padStart(7, "0")
-            .split("")
-            .map((d, i) => (
-              <span key={i} className="visit-digit">
-                {d}
-              </span>
-            ))}
         </div>
       </header>
 
