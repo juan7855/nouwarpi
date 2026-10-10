@@ -16,49 +16,80 @@ export function Win95Window(props: {
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState(props.defaultPos ?? { x: 24, y: 24 });
+  const [minimized, setMinimized] = useState(false);
+  const [maximized, setMaximized] = useState(false);
   const drag = useRef<{ dx: number; dy: number } | null>(null);
+
+  const isMobile = () => typeof window !== "undefined" && window.innerWidth < 820;
+
+  // Mantiene la ventana dentro del escritorio (nunca fuera por la izquierda,
+  // derecha ni por encima) y avisa al contenedor para que crezca.
+  const clampPos = (x: number, y: number) => {
+    const el = ref.current;
+    const parent = el?.offsetParent as HTMLElement | null;
+    if (!el || !parent) return { x, y };
+    const maxX = Math.max(0, parent.clientWidth - el.offsetWidth);
+    return { x: Math.max(0, Math.min(maxX, x)), y: Math.max(0, y) };
+  };
+
+  useEffect(() => {
+    const onResize = () => setPos((p) => clampPos(p.x, p.y));
+    onResize();
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    window.dispatchEvent(new Event("w95-layout"));
+  });
 
   const onPointerDown = (e: React.PointerEvent) => {
     props.onFocus?.();
-    if (!props.draggable) return;
-    if (window.innerWidth < 820) return; // en móvil apilado, no se arrastra
+    if (!props.draggable || maximized || isMobile()) return;
+    if ((e.target as HTMLElement).closest("button")) return;
     const el = ref.current;
     if (!el) return;
     const r = el.getBoundingClientRect();
     drag.current = { dx: e.clientX - r.left, dy: e.clientY - r.top };
-    (e.target as HTMLElement).setPointerCapture(e.pointerId);
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
   };
   const onPointerMove = (e: React.PointerEvent) => {
     if (!drag.current) return;
     const el = ref.current;
-    if (!el) return;
-    const w = el.offsetWidth;
-    let x = e.clientX - drag.current.dx;
-    let y = e.clientY - drag.current.dy;
-    x = Math.max(-w + 80, Math.min(window.innerWidth - 80, x));
-    y = Math.max(0, Math.min(window.innerHeight - 60, y));
-    setPos({ x, y });
+    const parent = el?.offsetParent as HTMLElement | null;
+    if (!el || !parent) return;
+    const pr = parent.getBoundingClientRect();
+    // el puntero no puede salir de la zona visible (sobre la barra de estado)
+    const cy = Math.max(0, Math.min(window.innerHeight - 60, e.clientY));
+    const x = e.clientX - pr.left - drag.current.dx;
+    const y = cy - pr.top - drag.current.dy;
+    setPos(clampPos(x, y));
   };
   const onPointerUp = () => {
     drag.current = null;
   };
 
-  const isMobile = typeof window !== "undefined" && window.innerWidth < 820;
+  const mobile = isMobile();
+  const floating = !mobile;
 
   return (
     <div
       ref={ref}
       className="w95-window"
       style={{
-        ...(isMobile
+        ...(!floating
           ? { position: "static", width: "100%", marginBottom: 14 }
-          : {
-              position: "absolute",
-              left: pos.x,
-              top: pos.y,
-              width: props.width ?? 420,
-              zIndex: props.zIndex ?? 1,
-            }),
+          : maximized
+            ? { position: "absolute", left: 0, top: 0, width: "100%", zIndex: 80 }
+            : {
+                position: "absolute",
+                left: pos.x,
+                top: pos.y,
+                width: props.width ?? 420,
+                maxWidth: "100%",
+                zIndex: props.zIndex ?? 1,
+              }),
         ...props.style,
       }}
       onPointerDown={props.onFocus}
@@ -68,17 +99,35 @@ export function Win95Window(props: {
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
+        onDoubleClick={() => floating && setMaximized((m) => !m)}
       >
         <span className="w95-titlebar-text">{props.title}</span>
         <span className="w95-titlebar-btns">
-          <button className="w95-tb-btn" tabIndex={-1} aria-label="Minimizar">_</button>
-          <button className="w95-tb-btn" tabIndex={-1} aria-label="Maximizar">□</button>
+          <button
+            className="w95-tb-btn"
+            tabIndex={-1}
+            aria-label="Minimizar"
+            onClick={() => setMinimized((m) => !m)}
+          >
+            _
+          </button>
+          <button
+            className="w95-tb-btn"
+            tabIndex={-1}
+            aria-label="Maximizar"
+            onClick={() => {
+              setMaximized((m) => !m);
+              setMinimized(false);
+            }}
+          >
+            {maximized ? "❐" : "□"}
+          </button>
           {props.onClose && (
             <button className="w95-tb-btn" tabIndex={-1} onClick={props.onClose} aria-label="Cerrar">✕</button>
           )}
         </span>
       </div>
-      <div className="w95-window-body">{props.children}</div>
+      {!minimized && <div className="w95-window-body">{props.children}</div>}
     </div>
   );
 }
@@ -261,8 +310,8 @@ export function HScrollbar(props: {
   const range = Math.max(1e-6, props.max - props.min);
   const page = Math.min(range, props.page ?? range * 0.25);
   const thumbW = Math.max(16, (page / range) * 100);
-  const thumbLeft =
-    ((props.value - props.min) / Math.max(1e-6, range - page)) * (100 - thumbW);
+  const frac = Math.max(0, Math.min(1, (props.value - props.min) / Math.max(1e-6, range - page)));
+  const thumbLeft = frac * (100 - thumbW);
 
   const valFromX = (clientX: number) => {
     const track = trackRef.current;
@@ -298,7 +347,7 @@ export function HScrollbar(props: {
       >
         <div
           className="w95-scroll-thumb"
-          style={{ left: `calc(${thumbLeft}% )`, width: `calc(${thumbW}% - 2px)` }}
+          style={{ left: `${thumbLeft}%`, width: `${thumbW}%` }}
           onPointerDown={(e) => {
             e.stopPropagation();
             (e.target as HTMLElement).setPointerCapture(e.pointerId);

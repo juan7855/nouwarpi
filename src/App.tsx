@@ -152,6 +152,27 @@ export default function App() {
   const [zoom, setZoom] = useState(160);
   const [scrollBar, setScrollBar] = useState(0);
   const [focus, setFocus] = useState("wave");
+  const mainRef = useRef<HTMLElement>(null);
+
+  // el escritorio crece para contener todas las ventanas (y no quedan bajo la barra de estado)
+  useEffect(() => {
+    const fit = () => {
+      const m = mainRef.current;
+      if (!m) return;
+      let bottom = 700;
+      m.querySelectorAll<HTMLElement>(":scope > .w95-window").forEach((w) => {
+        bottom = Math.max(bottom, w.offsetTop + w.offsetHeight + 56);
+      });
+      m.style.minHeight = bottom + "px";
+    };
+    fit();
+    window.addEventListener("w95-layout", fit);
+    window.addEventListener("resize", fit);
+    return () => {
+      window.removeEventListener("w95-layout", fit);
+      window.removeEventListener("resize", fit);
+    };
+  }, []);
   const [visits, setVisits] = useState(1);
   const [aboutOpen, setAboutOpen] = useState(false);
   const [dropHover, setDropHover] = useState(false);
@@ -612,12 +633,12 @@ export default function App() {
       </nav>
 
       {/* ventanas */}
-      <main className="px-2 pt-3 relative" style={{ minHeight: 980 }}>
+      <main ref={mainRef} className="px-2 pt-3 relative" style={{ minHeight: 700 }}>
         {/* ---- Archivo ---- */}
         <Win95Window
           title="Archivo"
           draggable
-          defaultPos={{ x: 16, y: 96 }}
+          defaultPos={{ x: 8, y: 8 }}
           width={350}
           zIndex={focus === "file" ? 60 : 10}
           onFocus={() => setFocus("file")}
@@ -710,7 +731,7 @@ export default function App() {
         <Win95Window
           title="Forma de onda"
           draggable
-          defaultPos={{ x: 390, y: 96 }}
+          defaultPos={{ x: 374, y: 8 }}
           width={640}
           zIndex={focus === "wave" ? 60 : 10}
           onFocus={() => setFocus("wave")}
@@ -848,7 +869,7 @@ export default function App() {
         <Win95Window
           title="Ajustes"
           draggable
-          defaultPos={{ x: 16, y: 540 }}
+          defaultPos={{ x: 8, y: 200 }}
           width={350}
           zIndex={focus === "ajustes" ? 60 : 10}
           onFocus={() => setFocus("ajustes")}
@@ -981,7 +1002,7 @@ export default function App() {
         <Win95Window
           title="Reproducción"
           draggable
-          defaultPos={{ x: 390, y: 640 }}
+          defaultPos={{ x: 374, y: 664 }}
           width={380}
           zIndex={focus === "repro" ? 60 : 10}
           onFocus={() => setFocus("repro")}
@@ -1042,7 +1063,7 @@ export default function App() {
         <Win95Window
           title="Exportar"
           draggable
-          defaultPos={{ x: 800, y: 640 }}
+          defaultPos={{ x: window.innerWidth >= 1420 ? 1030 : 740, y: window.innerWidth >= 1420 ? 8 : 664 }}
           width={330}
           zIndex={focus === "export" ? 60 : 10}
           onFocus={() => setFocus("export")}

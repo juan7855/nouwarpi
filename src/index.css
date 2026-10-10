@@ -61,6 +61,7 @@ body {
 /* ---------- ventana ---------- */
 
 .w95-window {
+  max-width: 100%;
   background: var(--face);
   box-shadow:
     inset -1px -1px var(--darkest),
@@ -237,7 +238,8 @@ body {
 /* ---------- casilla ---------- */
 
 .w95-check {
-  display: inline-flex;
+  display: flex;
+  width: fit-content;
   align-items: center;
   gap: 6px;
   cursor: pointer;
@@ -443,6 +445,8 @@ body {
 
 .w95-scroll-track {
   flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
   height: 14px;
   background: var(--face);
   position: relative;
