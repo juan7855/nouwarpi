@@ -46,6 +46,11 @@ function build(kind: "const" | "var", anchors: Anchor[]): WarpPlan {
   };
 }
 
+// Plan a partir de anclas ya calculadas (p. ej. las de Estefa).
+export function anchorPlan(anchors: Anchor[]): WarpPlan {
+  return build("var", anchors);
+}
+
 export function constantPlan(dur: number, factor: number): WarpPlan {
   return build("const", [
     { in: 0, out: 0 },

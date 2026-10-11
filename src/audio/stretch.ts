@@ -12,7 +12,7 @@
 //                cambia el tono (como un vinilo).
 
 import { FFT, hannWindow } from "./dsp";
-import { fineFlux } from "./tracker";
+import { fineFlux, onsetEvents } from "./tracker";
 
 const TWO_PI = 2 * Math.PI;
 
@@ -171,36 +171,7 @@ function detectOnsets(chs: Float32Array[], sr: number): number[] {
   const n = chs[0].length;
   const mono = new Float32Array(n);
   for (const c of chs) for (let i = 0; i < n; i++) mono[i] += c[i];
-  const fine = fineFlux(mono, sr);
-  const env = fine.env;
-  const nf = env.length;
-  if (nf < 16) return [];
-  const sample: number[] = [];
-  for (let i = 0; i < nf; i += 3) sample.push(env[i]);
-  sample.sort((a, b) => a - b);
-  const scale = sample[Math.floor(sample.length * 0.99)];
-  if (!(scale > 0)) return [];
-  const thr = Math.max(0.25 * scale, 1.5); // umbral absoluto: sin ataques reales no se ancla nada
-  const R = 6; // máximo local en ±6 fotogramas (~17 ms)
-  const minGap = Math.round(0.02 * sr);
-  const out: number[] = [];
-  for (let f = R; f < nf - R; f++) {
-    const v = env[f];
-    if (v < thr) continue;
-    let isMax = true;
-    for (let d = -R; d <= R; d++) {
-      if (env[f + d] > v || (env[f + d] === v && d < 0)) {
-        isMax = false;
-        break;
-      }
-    }
-    if (!isMax) continue;
-    let st = f;
-    while (st > f - 10 && st > 1 && env[st - 1] >= 0.35 * v) st--;
-    const pos = Math.round((st * fine.hop) / sr * sr + fine.delay * sr);
-    if (!out.length || pos - out[out.length - 1] >= minGap) out.push(pos);
-  }
-  return out;
+  return onsetEvents(fineFlux(mono, sr)).map((e) => Math.round(e.t * sr));
 }
 
 /* ------------------------------------------------------------------ */

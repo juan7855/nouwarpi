@@ -21,6 +21,14 @@ export interface BeatTrack {
   confidence: number; // 0..1
   downbeatPhase: number; // 0..beatsPerBar-1: índice de pulso (módulo) que más pesa
   firstSoundSec: number; // primer instante con sonido real
+  contentEnd: number; // último instante con sonido real (s)
+  goodBeats: number; // pulsos con ataque real y coherente (pocos = sin pulso claro)
+  onsets: OnsetEvent[]; // ataques detectados con su fuerza (los usa Estefa)
+}
+
+export interface OnsetEvent {
+  t: number; // segundos
+  s: number; // fuerza 0..1
 }
 
 interface Onset {
@@ -271,6 +279,64 @@ export function fineFlux(x: Float32Array, sr: number): FineEnv {
   return { env, hop, sr, delay: (FINE_DELAY_FRAC * N) / sr };
 }
 
+// Ataques con su fuerza (0..1, relativa a los más fuertes de la señal).
+export function onsetEvents(fine: FineEnv): OnsetEvent[] {
+  const { env, hop, sr, delay } = fine;
+  const nf = env.length;
+  if (nf < 16) return [];
+  const sample: number[] = [];
+  for (let i = 0; i < nf; i += 3) sample.push(env[i]);
+  sample.sort((a, b) => a - b);
+  const scale = sample[Math.floor(sample.length * 0.99)];
+  if (!(scale > 0)) return [];
+  const thr = Math.max(0.25 * scale, 1.5); // umbral absoluto: sin ataques reales no hay nada
+  const R = 6; // máximo local en ±6 fotogramas (~17 ms)
+  const minGap = 0.02;
+  const out: OnsetEvent[] = [];
+  for (let f = R; f < nf - R; f++) {
+    const v = env[f];
+    if (v < thr) continue;
+    let isMax = true;
+    for (let d = -R; d <= R; d++) {
+      if (env[f + d] > v || (env[f + d] === v && d < 0)) {
+        isMax = false;
+        break;
+      }
+    }
+    if (!isMax) continue;
+    let st = f;
+    while (st > f - 10 && st > 1 && env[st - 1] >= 0.35 * v) st--;
+    const t = (st * hop) / sr + delay;
+    if (!out.length || t - out[out.length - 1].t >= minGap) out.push({ t, s: Math.min(1, v / scale) });
+  }
+  return out;
+}
+
+// Un ataque real SUBE la energía respecto a los ~40 ms anteriores; un "bache" dentro de la
+// cola de un golpe grave (flujo espectral que oscila mientras la señal decae) no. Se descartan
+// los segundos.
+export function validateOnsets(x: Float32Array, sr: number, ev: OnsetEvent[]): OnsetEvent[] {
+  const rms = (a: number, b: number) => {
+    const i0 = Math.max(0, Math.floor(a * sr));
+    const i1 = Math.min(x.length, Math.floor(b * sr));
+    if (i1 <= i0) return 0;
+    let s = 0;
+    for (let i = i0; i < i1; i++) s += x[i] * x[i];
+    return Math.sqrt(s / (i1 - i0));
+  };
+  const kept: { e: OnsetEvent; loud: number }[] = [];
+  for (const e of ev) {
+    const after = rms(e.t, e.t + 0.03);
+    const before = rms(e.t - 0.045, e.t - 0.005);
+    if (after >= 1.25 * before || before < 1e-4) kept.push({ e, loud: after });
+  }
+  if (!kept.length) return [];
+  // la fuerza espectral satura casi siempre en 1; la sonoridad conserva los acentos
+  const sorted = kept.map((k) => k.loud).sort((a, b) => a - b);
+  const ref = Math.max(1e-9, sorted[Math.floor(sorted.length * 0.9)]);
+  return kept.map(({ e, loud }) => ({ t: e.t, s: Math.min(1, 0.7 * Math.min(1, loud / ref) + 0.3 * e.s) }));
+}
+
 // Inicio real del ataque cerca de approxSec (±winSec). null si no hay ataque claro.
 export function refineOnset(fine: FineEnv, approxSec: number, winSec = 0.04): { t: number; peak: number } | null {
   const { env, hop, sr, delay } = fine;
@@ -348,6 +414,8 @@ export function trackBeats(
   const frames = dpBeats(o, periodFrames);
   onProgress(0.8);
   const fine = fineFlux(x, sr);
+  const onsets = validateOnsets(x, sr, onsetEvents(fine));
+  const contentEnd = lastSound(x, sr);
 
   // pulsos del DP → tiempo refinado
   let beats = frames.map((f) => (f * o.hop + o.N * 0.7) / sr); // centro de la ventana de análisis
@@ -376,6 +444,9 @@ export function trackBeats(
       confidence: 0,
       downbeatPhase: 0,
       firstSoundSec: firstSound(x, sr),
+      contentEnd,
+      goodBeats: 0,
+      onsets,
     };
   }
 
@@ -469,6 +540,9 @@ export function trackBeats(
       confidence: 0,
       downbeatPhase: 0,
       firstSoundSec: firstSound(x, sr),
+      contentEnd,
+      goodBeats: 0,
+      onsets,
     };
   }
 
@@ -562,6 +636,9 @@ export function trackBeats(
     confidence,
     downbeatPhase,
     firstSoundSec: firstSound(x, sr),
+    contentEnd,
+    goodBeats: gi.length,
+    onsets,
   };
 }
 
@@ -581,4 +658,15 @@ export function firstSound(x: Float32Array, sr: number): number {
     if (Math.abs(x[i]) > thr) return Math.max(0, i - 256) / sr;
   }
   return 0;
+}
+
+// último instante con sonido real (por encima de ~-48 dB del máximo)
+export function lastSound(x: Float32Array, sr: number): number {
+  let mx = 0;
+  for (let i = 0; i < x.length; i += 16) mx = Math.max(mx, Math.abs(x[i]));
+  const thr = mx * 0.004;
+  for (let i = x.length - 1; i >= 0; i -= 32) {
+    if (Math.abs(x[i]) > thr) return Math.min(x.length, i + 256) / sr;
+  }
+  return x.length / sr;
 }

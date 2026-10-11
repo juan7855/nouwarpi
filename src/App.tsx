@@ -13,7 +13,8 @@ import {
 import { Waveform, Peaks } from "./components/Waveform";
 import { Engine } from "./audio/engine";
 import type { BeatTrack } from "./audio/tracker";
-import { constantPlan, variablePlan, scaleBeats, WarpPlan } from "./audio/warp";
+import { constantPlan, variablePlan, scaleBeats, anchorPlan, WarpPlan } from "./audio/warp";
+import { estefa } from "./audio/estefa";
 import { Processor, CANCELLED } from "./audio/processor";
 import { decodeAudioFile } from "./audio/decode";
 import type { StretchMethod } from "./audio/stretch";
@@ -141,7 +142,9 @@ export default function App() {
   const [method, setMethod] = useState<StretchMethod>("wsola");
   const [embedTempo, setEmbedTempo] = useState(true);
   const [track, setTrack] = useState<BeatTrack | null>(null);
-  const [tempoMode, setTempoMode] = useState<"const" | "var">("const");
+  const [tempoMode, setTempoMode] = useState<"const" | "var" | "estefa">("const");
+  const [estefaStrength, setEstefaStrength] = useState(1);
+  const [estefaPick, setEstefaPick] = useState(0);
   const [beatMult, setBeatMult] = useState<1 | 2 | 0.5>(1);
   const [analyzing, setAnalyzing] = useState(false);
   const [metronomeOn, setMetronomeOn] = useState(false);
@@ -225,16 +228,52 @@ export default function App() {
         : null,
     [file, tempoMode, track, beatsAdj, markerSec, beatLen]
   );
-  const plan: WarpPlan = useMemo(
-    () => varResult?.plan ?? constantPlan(file ? file.duration : 1, factor),
-    [varResult, file, factor]
+  // Estefa: sincronización automática (sin BPM de origen) con cuantizado elástico
+  const estefaRes = useMemo(
+    () =>
+      file && tempoMode === "estefa" && track
+        ? estefa({
+            onsets: track.onsets,
+            markerSec,
+            contentEnd: track.contentEnd,
+            dur: file.duration,
+            projBeatLen: beatLen,
+            beatsPerBar,
+            strength: estefaStrength,
+            pick: estefaPick,
+          })
+        : null,
+    [file, tempoMode, track, markerSec, beatLen, beatsPerBar, estefaStrength, estefaPick]
   );
+  const plan: WarpPlan = useMemo(
+    () =>
+      varResult?.plan ??
+      (estefaRes ? anchorPlan(estefaRes.anchors) : constantPlan(file ? file.duration : 1, factor)),
+    [varResult, estefaRes, file, factor]
+  );
+  // pulsos que se dibujan en la onda original: los detectados (variable) o la rejilla de Estefa
+  const viewBeats = useMemo(() => {
+    if (tempoMode === "var" && track) return beatsAdj;
+    if (tempoMode === "estefa" && estefaRes && file) {
+      const out: number[] = [];
+      const m = plan.fwd(markerSec);
+      for (let k = -64; k < 4096; k++) {
+        const o = m + k * beatLen;
+        if (o <= 0) continue;
+        if (o >= plan.stretchedDur) break;
+        out.push(plan.inv(o));
+      }
+      return out;
+    }
+    return undefined;
+  }, [tempoMode, track, beatsAdj, estefaRes, file, plan, markerSec, beatLen]);
   const beatZero = useMemo(() => {
+    if (!viewBeats) return 0;
     let j = 0;
-    for (let i = 1; i < beatsAdj.length; i++)
-      if (Math.abs(beatsAdj[i] - markerSec) < Math.abs(beatsAdj[j] - markerSec)) j = i;
+    for (let i = 1; i < viewBeats.length; i++)
+      if (Math.abs(viewBeats[i] - markerSec) < Math.abs(viewBeats[j] - markerSec)) j = i;
     return j;
-  }, [beatsAdj, markerSec]);
+  }, [viewBeats, markerSec]);
 
   const markerStretched = plan.fwd(markerSec);
   const pad = useMemo(() => {
@@ -296,6 +335,7 @@ export default function App() {
     setTrack(null);
     setDetected(null);
     setTempoMode("const");
+    setEstefaPick(0);
     setBeatMult(1);
     setIrregular(false);
     setScrollBar(0);
@@ -318,13 +358,16 @@ export default function App() {
         setMarkerSec(marker);
         setOriginalBPM(Math.round(tr.bpm * 100) / 100);
         setDetected({ firstBeat: marker, bpm: tr.bpm, conf: tr.confidence });
-        setTempoMode(tr.constantOk ? "const" : "var");
+        const noPulse = tr.goodBeats < 8;
+        setTempoMode(noPulse ? "estefa" : tr.constantOk ? "const" : "var");
         setIrregular(!tr.constantOk);
         setAnalyzing(false);
         setStatus(
-          tr.constantOk
-            ? `Tempo estable: ${tr.bpm.toFixed(2)} BPM`
-            : `Tempo variable (deriva ${tr.driftMs.toFixed(0)} ms): se sigue cada pulso`
+          noPulse
+            ? "Sin pulso claro: Estefa decide el encaje"
+            : tr.constantOk
+              ? `Tempo estable: ${tr.bpm.toFixed(2)} BPM`
+              : `Tempo variable (deriva ${tr.driftMs.toFixed(0)} ms): se sigue cada pulso`
         );
       })
       .catch((e) => {
@@ -840,7 +883,7 @@ export default function App() {
               peaks={peaksOrig}
               originSec={markerSec}
               beatLenSec={origBeatLen}
-              beatTimes={tempoMode === "var" && track ? beatsAdj : undefined}
+              beatTimes={viewBeats}
               beatZero={beatZero}
               beatsPerBar={beatsPerBar}
               totalBars={origBars}
@@ -926,11 +969,11 @@ export default function App() {
                   onChange={setOriginalBPM}
                   min={30}
                   max={300}
-                  disabled={tempoMode === "var"}
+                  disabled={tempoMode !== "const"}
                 />
                 <W95Button
                   onClick={() => bumpTempo(0.5)}
-                  disabled={!file}
+                  disabled={!file || tempoMode === "estefa"}
                   title="La lectura es el doble de rápida de lo que sientes: dividir entre 2"
                   style={{ minWidth: 0, padding: "3px 7px" }}
                 >
@@ -938,7 +981,7 @@ export default function App() {
                 </W95Button>
                 <W95Button
                   onClick={() => bumpTempo(2)}
-                  disabled={!file}
+                  disabled={!file || tempoMode === "estefa"}
                   title="La lectura es la mitad de rápida de lo que sientes: multiplicar por 2"
                   style={{ minWidth: 0, padding: "3px 7px" }}
                 >
@@ -957,16 +1000,65 @@ export default function App() {
                 </span>
                 <W95Select
                   value={tempoMode}
-                  onChange={(v) => setTempoMode(v as "const" | "var")}
+                  onChange={(v) => {
+                    setTempoMode(v as "const" | "var" | "estefa");
+                    setEstefaPick(0);
+                  }}
                   disabled={!track}
                   options={[
                     { value: "const", label: "Constante (un solo BPM)" },
                     { value: "var", label: "Seguir los pulsos (variable)" },
+                    { value: "estefa", label: "Estefa (automático, sin BPM)" },
                   ]}
                 />
               </div>
+              {tempoMode === "estefa" && estefaRes && (
+                <div className="flex flex-col gap-1 mt-1">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="w95-label" style={{ width: 105, flex: "0 0 auto" }}>
+                      Interpretación:
+                    </span>
+                    <W95Select
+                      value={String(Math.min(estefaPick, estefaRes.candidates.length - 1))}
+                      onChange={(v) => setEstefaPick(parseInt(v, 10))}
+                      options={estefaRes.candidates.map((c, i) => ({
+                        value: String(i),
+                        label: (i === 0 ? "★ " : "") + c.label,
+                      }))}
+                    />
+                  </div>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="w95-label" style={{ width: 105, flex: "0 0 auto" }}>
+                      Cuantizado:
+                    </span>
+                    <W95Select
+                      value={String(estefaStrength)}
+                      onChange={(v) => setEstefaStrength(parseFloat(v))}
+                      options={[
+                        { value: "0", label: "0 % (solo estirar)" },
+                        { value: "0.5", label: "50 %" },
+                        { value: "0.75", label: "75 %" },
+                        { value: "1", label: "100 % (a la rejilla)" },
+                      ]}
+                    />
+                  </div>
+                  <div className="w95-label" style={{ color: "#404040" }}>
+                    {`Estefa lee ${estefaRes.naturalBpm.toFixed(1)} BPM naturales y los lleva a ${projectBPM} (×${estefaRes.best.factor.toFixed(3)}). Rejilla de ${
+                      { 1: "negras", 2: "corcheas", 3: "tresillos", 4: "semicorcheas", 6: "tresillos de semicorchea" }[estefaRes.best.subdiv] ?? "—"
+                    }; ${estefaRes.snapped} de ${estefaRes.total} sonidos cuantizados. Confianza ${Math.round(estefaRes.confidence * 100)} %.`}
+                  </div>
+                  {estefaRes.confidence < 0.35 && (
+                    <div className="w95-warn">
+                      Poca confianza: el audio no tiene un pulso claro. Revisa la interpretación o baja el cuantizado.
+                    </div>
+                  )}
+                </div>
+              )}
+              {tempoMode === "estefa" && !estefaRes && track && (
+                <div className="w95-warn mt-1">Estefa no encontró sonidos suficientes para decidir.</div>
+              )}
               {analyzing && <div className="w95-label" style={{ color: "#404040" }}>Leyendo los pulsos de la canción…</div>}
-              {track && (
+              {track && tempoMode !== "estefa" && (
                 <div className="w95-label" style={{ color: "#404040", marginTop: 2 }}>
                   {tempoMode === "var"
                     ? `Cada tramo entre pulsos se estira para caer en la rejilla (${track.beats.length} pulsos).`
@@ -1235,6 +1327,7 @@ export default function App() {
                 ajústalo al tempo de tu proyecto y descárgalo sincronizado.
               </div>
               <div className="w95-label">· Lee los pulsos de toda la canción; si el tempo se mueve, alinea cada pulso a la rejilla</div>
+              <div className="w95-label">· Estefa: sin BPM de origen, decide el tempo natural y cuantiza elásticamente cada sonido</div>
               <div className="w95-label">· Estirado en un Web Worker: tres algoritmos, golpes anclados al compás</div>
               <div className="w95-label">· Estéreo intacto, misma frecuencia de muestreo</div>
               <div className="w95-label">· Sin normalizar, sin comprimir, sin efectos</div>
