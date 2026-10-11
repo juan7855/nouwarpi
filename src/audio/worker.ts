@@ -1,31 +1,42 @@
-// Web Worker: ejecuta el estirado fuera del hilo de la interfaz.
-// La interfaz nunca se congela y un cambio de BPM cancela el cálculo anterior
+// Web Worker: ejecuta el análisis de pulsos y el estirado fuera del hilo de la interfaz.
+// La interfaz nunca se congela y un cambio de parámetros cancela el cálculo anterior
 // (el Processor termina este worker y crea otro).
 
-import { stretchChannels, StretchMethod } from "./stretch";
+import { stretchChannels, StretchMethod, Anchor } from "./stretch";
+import { trackBeats } from "./tracker";
 
-interface Job {
-  id: number;
-  channels: Float32Array[];
-  sampleRate: number;
-  factor: number;
-  method: StretchMethod;
-}
+type Job =
+  | {
+      id: number;
+      type: "stretch";
+      channels: Float32Array[];
+      sampleRate: number;
+      warp: number | Anchor[];
+      method: StretchMethod;
+    }
+  | { id: number; type: "track"; channels: Float32Array[]; sampleRate: number; beatsPerBar: number };
 
 const post = (msg: unknown, transfer: Transferable[] = []) =>
   (self as unknown as Worker).postMessage(msg, transfer);
 
 self.onmessage = (e: MessageEvent<Job>) => {
-  const { id, channels, sampleRate, factor, method } = e.data;
+  const job = e.data;
   try {
-    const out = stretchChannels(channels, sampleRate, factor, method, (frac) =>
-      post({ id, type: "progress", frac })
+    if (job.type === "track") {
+      const result = trackBeats(job.channels[0], job.sampleRate, job.beatsPerBar, (frac) =>
+        post({ id: job.id, type: "progress", frac })
+      );
+      post({ id: job.id, type: "done", result });
+      return;
+    }
+    const out = stretchChannels(job.channels, job.sampleRate, job.warp, job.method, (frac) =>
+      post({ id: job.id, type: "progress", frac })
     );
     post(
-      { id, type: "done", channels: out },
+      { id: job.id, type: "done", result: out },
       out.map((c) => c.buffer)
     );
   } catch (err) {
-    post({ id, type: "error", message: err instanceof Error ? err.message : String(err) });
+    post({ id: job.id, type: "error", message: err instanceof Error ? err.message : String(err) });
   }
 };

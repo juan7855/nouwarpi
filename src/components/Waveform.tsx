@@ -17,6 +17,8 @@ interface Props {
   beatLenSec: number;
   beatsPerBar: number;
   totalBars: number; // compases totales (para limitar desplazamiento)
+  beatTimes?: number[]; // pulsos reales (s) en el dominio de esta vista; sustituyen a la rejilla uniforme
+  beatZero?: number; // índice en beatTimes del pulso 1 del compás de referencia
   markerSec: number;
   onMarkerChange?: (t: number) => void;
   cursorSec: number;
@@ -102,9 +104,14 @@ export function Waveform(props: Props) {
     const firstBeat = Math.floor((tLeft - originSec) / beatLenSec) - 1;
     ctx.font = "10px 'Courier New', monospace";
     ctx.textAlign = "left";
-    for (let b = firstBeat; ; b++) {
-      const t = originSec + b * beatLenSec;
+    const bt = props.beatTimes;
+    const bz = props.beatZero ?? 0;
+    for (let n = bt ? 0 : firstBeat; ; n++) {
+      if (bt && n >= bt.length) break;
+      const b = bt ? n - bz : n;
+      const t = bt ? bt[n] : originSec + b * beatLenSec;
       if (t > tRight) break;
+      if (bt && t < tLeft - 0.05) continue;
       const x = timeToX(t);
       const isBar = b % beatsPerBar === 0;
       const back = b < 0;

@@ -12,14 +12,8 @@ import {
 } from "./components/w95";
 import { Waveform, Peaks } from "./components/Waveform";
 import { Engine } from "./audio/engine";
-import {
-  computeOnsetEnvelope,
-  detectFirstBeat,
-  detectBpmFrom,
-  refineFirstBeat,
-  refineBpm,
-  OnsetEnvelope,
-} from "./audio/analysis";
+import type { BeatTrack } from "./audio/tracker";
+import { constantPlan, variablePlan, scaleBeats, WarpPlan } from "./audio/warp";
 import { Processor, CANCELLED } from "./audio/processor";
 import { decodeAudioFile } from "./audio/decode";
 import type { StretchMethod } from "./audio/stretch";
@@ -61,6 +55,19 @@ function mixToMono(buf: AudioBuffer): Float32Array {
   }
   if (buf.numberOfChannels > 1) for (let i = 0; i < n; i++) out[i] /= buf.numberOfChannels;
   return out;
+}
+
+// primer tiempo fuerte (inicio de compás) a partir del primer sonido real
+function firstDownbeat(tr: BeatTrack, bpb: number): number {
+  const beats = tr.beats;
+  if (!beats.length) return tr.firstSoundSec;
+  let i = beats.findIndex((b) => b >= tr.firstSoundSec - 0.08);
+  if (i < 0) i = 0;
+  for (let n = 0; n < bpb && i < beats.length - 1; n++) {
+    if ((((i - tr.downbeatPhase) % bpb) + bpb) % bpb === 0) break;
+    i++;
+  }
+  return beats[i];
 }
 
 const clampMarker = (t: number, max: number) => Math.max(0, Math.min(max, t));
@@ -133,6 +140,10 @@ export default function App() {
   const [beatsPerBar, setBeatsPerBar] = useState(4);
   const [method, setMethod] = useState<StretchMethod>("wsola");
   const [embedTempo, setEmbedTempo] = useState(true);
+  const [track, setTrack] = useState<BeatTrack | null>(null);
+  const [tempoMode, setTempoMode] = useState<"const" | "var">("const");
+  const [beatMult, setBeatMult] = useState<1 | 2 | 0.5>(1);
+  const [analyzing, setAnalyzing] = useState(false);
   const [metronomeOn, setMetronomeOn] = useState(false);
   const [exportMode, setExportMode] = useState<"all" | "beat" | "sel">("all");
   const [selStart, setSelStart] = useState(1);
@@ -179,12 +190,14 @@ export default function App() {
   const [tapCount, setTapCount] = useState(0);
   const [exportBusy, setExportBusy] = useState(false);
 
-  const envRef = useRef<OnsetEnvelope | null>(null);
-  const monoRef = useRef<Float32Array | null>(null);
   const stretchedRef = useRef<AudioBuffer | null>(null);
   const procToken = useRef(0);
+  const analyzeToken = useRef(0);
   const processorRef = useRef<Processor | null>(null);
   if (!processorRef.current) processorRef.current = new Processor();
+  const analyzerRef = useRef<Processor | null>(null);
+  if (!analyzerRef.current) analyzerRef.current = new Processor();
+  const autoMarkerRef = useRef(0);
   const tapsRef = useRef<number[]>([]);
   const rafRef = useRef<number>(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -199,19 +212,44 @@ export default function App() {
   const barLen = beatLen * beatsPerBar;
   const origBeatLen = 60 / originalBPM;
   const origBarLen = origBeatLen * beatsPerBar;
+
+  // pulsos detectados (con la subdivisión elegida) y plan de alineación
+  const beatsAdj = useMemo(
+    () => (track ? scaleBeats(track.beats, beatMult, markerSec) : []),
+    [track, beatMult, markerSec]
+  );
+  const varResult = useMemo(
+    () =>
+      file && tempoMode === "var" && track
+        ? variablePlan(beatsAdj, markerSec, beatLen, file.duration)
+        : null,
+    [file, tempoMode, track, beatsAdj, markerSec, beatLen]
+  );
+  const plan: WarpPlan = useMemo(
+    () => varResult?.plan ?? constantPlan(file ? file.duration : 1, factor),
+    [varResult, file, factor]
+  );
+  const beatZero = useMemo(() => {
+    let j = 0;
+    for (let i = 1; i < beatsAdj.length; i++)
+      if (Math.abs(beatsAdj[i] - markerSec) < Math.abs(beatsAdj[j] - markerSec)) j = i;
+    return j;
+  }, [beatsAdj, markerSec]);
+
+  const markerStretched = plan.fwd(markerSec);
   const pad = useMemo(() => {
     if (!file) return 0;
-    const r = (markerSec * factor) % barLen;
+    const r = markerStretched % barLen;
     return r < 1e-6 || barLen - r < 1e-6 ? 0 : barLen - r;
-  }, [file, markerSec, factor, barLen]);
-  const stretchedDur = file ? file.duration * factor : 0;
+  }, [file, markerStretched, barLen]);
+  const stretchedDur = file ? plan.stretchedDur : 0;
   const totalOut = pad + stretchedDur;
   const outBars = file ? Math.max(1, Math.ceil(totalOut / barLen - 1e-9)) : 0;
   const origBars = file ? Math.max(1, Math.ceil(file.duration / origBarLen - 1e-9)) : 0;
-  const tempoChangePct = (factor - 1) * 100;
+  const tempoChangePct = (plan.avgFactor - 1) * 100;
   const tempoWarn = Math.abs(tempoChangePct) > 25;
 
-  const markerOut = pad + markerSec * factor; // el primer golpe, siempre en una línea de compás
+  const markerOut = pad + markerStretched; // el marcador, siempre en una línea de compás
 
   const exportPlan = useMemo(() => {
     if (!file) return null;
@@ -249,30 +287,52 @@ export default function App() {
       channels: buf.numberOfChannels,
     };
     const peaks = computePeaks(buf, 256);
-    const mono = mixToMono(buf);
-    monoRef.current = mono;
-    const env = computeOnsetEnvelope(mono, buf.sampleRate);
-    envRef.current = env;
-    const fb = refineFirstBeat(mono, buf.sampleRate, detectFirstBeat(env));
-    const bpmRes = detectBpmFrom(env, fb);
-    bpmRes.bpm = Math.round(refineBpm(mono, buf.sampleRate, fb, bpmRes.bpm) * 100) / 100;
     setFile(info);
     setPeaksOrig(peaks);
     setPeaksAdj(null);
     stretchedRef.current = null;
-    setMarkerSec(fb);
+    setMarkerSec(0);
     setCursorSec(0);
-    setOriginalBPM(bpmRes.bpm);
-    setDetected({ firstBeat: fb, bpm: bpmRes.bpm, conf: bpmRes.confidence });
-    setIrregular(!bpmRes.stable);
-    setStatus(
-      !bpmRes.stable
-        ? "Aviso: tempo irregular o con cambios. Corrige el BPM a mano."
-        : "Listo"
-    );
+    setTrack(null);
+    setDetected(null);
+    setTempoMode("const");
+    setBeatMult(1);
+    setIrregular(false);
     setScrollBar(0);
     setTapCount(0);
     tapsRef.current = [];
+
+    // lectura de los pulsos de TODA la canción (en el worker)
+    const token = ++analyzeToken.current;
+    setAnalyzing(true);
+    setStatus("Analizando pulsos…");
+    analyzerRef
+      .current!.track(mixToMono(buf), buf.sampleRate, 4, (frac) => {
+        if (token === analyzeToken.current) setStatus(`Analizando pulsos… ${Math.round(frac * 100)}%`);
+      })
+      .then((tr) => {
+        if (token !== analyzeToken.current) return;
+        const marker = firstDownbeat(tr, 4);
+        autoMarkerRef.current = marker;
+        setTrack(tr);
+        setMarkerSec(marker);
+        setOriginalBPM(Math.round(tr.bpm * 100) / 100);
+        setDetected({ firstBeat: marker, bpm: tr.bpm, conf: tr.confidence });
+        setTempoMode(tr.constantOk ? "const" : "var");
+        setIrregular(!tr.constantOk);
+        setAnalyzing(false);
+        setStatus(
+          tr.constantOk
+            ? `Tempo estable: ${tr.bpm.toFixed(2)} BPM`
+            : `Tempo variable (deriva ${tr.driftMs.toFixed(0)} ms): se sigue cada pulso`
+        );
+      })
+      .catch((e) => {
+        if (e instanceof Error && e.message === CANCELLED) return;
+        if (token !== analyzeToken.current) return;
+        setAnalyzing(false);
+        setStatus("No se pudo leer el tempo: ajústalo a mano.");
+      });
   }, []);
 
   const loadFile = useCallback(
@@ -301,7 +361,7 @@ export default function App() {
     const token = ++procToken.current;
     const processor = processorRef.current!;
     const t = setTimeout(async () => {
-      if (Math.abs(factor - 1) < 0.0005) {
+      if (plan.kind === "const" && Math.abs(plan.avgFactor - 1) < 0.0005) {
         stretchedRef.current = file.buffer;
         setPeaksAdj(peaksOrig);
         setClipWarn(null);
@@ -314,7 +374,12 @@ export default function App() {
       try {
         const chs: Float32Array[] = [];
         for (let c = 0; c < file.channels; c++) chs.push(file.buffer.getChannelData(c).slice());
-        const out = await processor.run(chs, file.sampleRate, factor, method, (frac) => {
+        const sr = file.sampleRate;
+        const warp =
+          plan.kind === "const"
+            ? plan.avgFactor
+            : plan.anchors.map((a) => ({ in: a.in * sr, out: a.out * sr }));
+        const out = await processor.stretch(chs, sr, warp, method, (frac) => {
           if (token === procToken.current) setProc({ active: true, label: "Procesando…", frac });
         });
         if (token !== procToken.current) return;
@@ -342,7 +407,7 @@ export default function App() {
       processor.cancel();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [file, factor, method]);
+  }, [file, plan, method]);
 
   /* ---------- reproducción ---------- */
 
@@ -359,7 +424,6 @@ export default function App() {
       eng.stop();
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
 
-      const f = factor;
       let buffer: AudioBuffer;
       let offsetSrc: number;
 
@@ -373,10 +437,10 @@ export default function App() {
         offsetSrc = startOut - pad;
       } else {
         buffer = file.buffer;
-        offsetSrc = (startOut - pad) / f;
+        offsetSrc = plan.inv(Math.max(0, startOut - pad));
       }
 
-      const srcFromOut = (o: number) => (mode === "adj" ? o - pad : (o - pad) / f);
+      const srcFromOut = (o: number) => (mode === "adj" ? o - pad : plan.inv(Math.max(0, o - pad)));
 
       let loopStartSrc: number | undefined;
       let loopEndSrc: number | undefined;
@@ -417,8 +481,8 @@ export default function App() {
         // modo original: el audio avanza 1:1 desde su desplazamiento
         const cur =
           mode === "adj"
-            ? (startOut + el - pad) / f
-            : (startOut - pad) / f + el;
+            ? plan.inv(Math.max(0, startOut + el - pad))
+            : plan.inv(Math.max(0, startOut - pad)) + el;
         setCursorSec(Math.max(0, cur));
         rafRef.current = requestAnimationFrame(tick);
       };
@@ -427,15 +491,15 @@ export default function App() {
         mode === "adj" ? "Reproduciendo: ajustado" : "Reproduciendo: original"
       );
     },
-    [file, factor, pad, loopOn, loopBars, barLen, metronomeOn, projectBPM, beatsPerBar]
+    [file, plan, pad, loopOn, loopBars, barLen, metronomeOn, projectBPM, beatsPerBar]
   );
 
   const onCompare = useCallback(() => {
     if (!file) return;
     const n = sourceMode === "adj" ? "orig" : "adj";
     setSourceMode(n);
-    startPlayback(n, cursorSec * factor + pad);
-  }, [file, sourceMode, startPlayback, cursorSec, factor, pad]);
+    startPlayback(n, plan.fwd(cursorSec) + pad);
+  }, [file, sourceMode, startPlayback, cursorSec, plan, pad]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -447,39 +511,41 @@ export default function App() {
       ) {
         e.preventDefault();
         if (engineRef.current!.playing) stopPlayback();
-        else startPlayback(sourceMode, cursorSec * factor + pad);
+        else startPlayback(sourceMode, plan.fwd(cursorSec) + pad);
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [startPlayback, stopPlayback, sourceMode, cursorSec, factor, pad]);
+  }, [startPlayback, stopPlayback, sourceMode, cursorSec, plan, pad]);
 
   /* ---------- detección / tap ---------- */
 
   const onDetectBpm = useCallback(() => {
-    const env = envRef.current;
-    if (!env) return;
-    const r = detectBpmFrom(env, markerSec);
-    if (monoRef.current && file) {
-      r.bpm = Math.round(refineBpm(monoRef.current, file.sampleRate, markerSec, r.bpm) * 100) / 100;
+    if (!track) {
+      setStatus(analyzing ? "Aún analizando…" : "No hay lectura de pulsos disponible.");
+      return;
     }
-    setOriginalBPM(r.bpm);
-    setIrregular(!r.stable);
+    setOriginalBPM(Math.round(track.bpm * 100) / 100);
+    setBeatMult(1);
+    setIrregular(!track.constantOk);
     setStatus(
-      !r.stable
-        ? "Aviso: tempo irregular o con cambios."
-        : `BPM detectado: ${r.bpm} (confianza ${Math.round(r.confidence * 100)}%)`
+      track.constantOk
+        ? `BPM detectado: ${track.bpm.toFixed(2)} (desvío ${track.rmsMs.toFixed(1)} ms)`
+        : `Tempo variable: BPM medio ${track.bpm.toFixed(2)}`
     );
-  }, [markerSec, file]);
+  }, [track, analyzing]);
 
   const onDetectFirst = useCallback(() => {
-    const env = envRef.current;
-    if (!env || !file) return;
-    let fb = detectFirstBeat(env);
-    if (monoRef.current) fb = refineFirstBeat(monoRef.current, file.sampleRate, fb);
+    if (!file || !track) return;
+    const fb = firstDownbeat(track, beatsPerBar);
     setMarkerSec(fb);
-    setStatus("Primer golpe detectado: " + fb.toFixed(3) + " s");
-  }, [file]);
+    setStatus("Primer tiempo fuerte: " + fb.toFixed(3) + " s");
+  }, [file, track, beatsPerBar]);
+
+  const bumpTempo = useCallback((k: 2 | 0.5) => {
+    setBeatMult((m) => (m * k === 2 ? 2 : m * k === 0.5 ? 0.5 : m * k === 1 ? 1 : m));
+    setOriginalBPM((v) => Math.min(300, Math.max(30, Math.round(v * k * 100) / 100)));
+  }, []);
 
   const onTap = useCallback(() => {
     const now = performance.now();
@@ -774,6 +840,8 @@ export default function App() {
               peaks={peaksOrig}
               originSec={markerSec}
               beatLenSec={origBeatLen}
+              beatTimes={tempoMode === "var" && track ? beatsAdj : undefined}
+              beatZero={beatZero}
               beatsPerBar={beatsPerBar}
               totalBars={origBars}
               markerSec={markerSec}
@@ -799,11 +867,11 @@ export default function App() {
               totalBars={outBars}
               markerSec={pad}
               onMarkerChange={(t) =>
-                file && setMarkerSec(clampMarker((t - pad) / factor, file.duration))
+                file && setMarkerSec(clampMarker(plan.inv(Math.max(0, t - pad)), file.duration))
               }
-              cursorSec={cursorSec * factor + pad}
+              cursorSec={plan.fwd(cursorSec) + pad}
               onCursorChange={(t) =>
-                file && setCursorSec(clampMarker((t - pad) / factor, file.duration))
+                file && setCursorSec(clampMarker(plan.inv(Math.max(0, t - pad)), file.duration))
               }
               zoom={zoom}
               onZoomChange={setZoom}
@@ -858,14 +926,55 @@ export default function App() {
                   onChange={setOriginalBPM}
                   min={30}
                   max={300}
+                  disabled={tempoMode === "var"}
                 />
-                <W95Button onClick={onDetectBpm} disabled={!file}>
+                <W95Button
+                  onClick={() => bumpTempo(0.5)}
+                  disabled={!file}
+                  title="La lectura es el doble de rápida de lo que sientes: dividir entre 2"
+                  style={{ minWidth: 0, padding: "3px 7px" }}
+                >
+                  ÷2
+                </W95Button>
+                <W95Button
+                  onClick={() => bumpTempo(2)}
+                  disabled={!file}
+                  title="La lectura es la mitad de rápida de lo que sientes: multiplicar por 2"
+                  style={{ minWidth: 0, padding: "3px 7px" }}
+                >
+                  ×2
+                </W95Button>
+                <W95Button onClick={onDetectBpm} disabled={!file || analyzing}>
                   Detectar BPM
                 </W95Button>
                 <W95Button onClick={onTap} disabled={!file}>
                   Tap ({tapCount})
                 </W95Button>
               </div>
+              <div className="flex items-center gap-2 mt-1">
+                <span className="w95-label" style={{ width: 105, flex: "0 0 auto" }}>
+                  Modo de tempo:
+                </span>
+                <W95Select
+                  value={tempoMode}
+                  onChange={(v) => setTempoMode(v as "const" | "var")}
+                  disabled={!track}
+                  options={[
+                    { value: "const", label: "Constante (un solo BPM)" },
+                    { value: "var", label: "Seguir los pulsos (variable)" },
+                  ]}
+                />
+              </div>
+              {analyzing && <div className="w95-label" style={{ color: "#404040" }}>Leyendo los pulsos de la canción…</div>}
+              {track && (
+                <div className="w95-label" style={{ color: "#404040", marginTop: 2 }}>
+                  {tempoMode === "var"
+                    ? `Cada tramo entre pulsos se estira para caer en la rejilla (${track.beats.length} pulsos).`
+                    : track.constantOk
+                      ? `Tempo estable: desvío ${track.rmsMs.toFixed(1)} ms.`
+                      : `Aviso: el tempo se mueve hasta ${track.driftMs.toFixed(0)} ms; usa "Seguir los pulsos".`}
+                </div>
+              )}
               <div className="flex items-center gap-2 mt-1">
                 <span className="w95-label" style={{ width: 105, flex: "0 0 auto" }}>
                   Compás:
@@ -986,7 +1095,7 @@ export default function App() {
           <div className="flex flex-col gap-2">
             <div className="flex gap-2 flex-wrap">
               <W95Button
-                onClick={() => startPlayback(sourceMode, cursorSec * factor + pad)}
+                onClick={() => startPlayback(sourceMode, plan.fwd(cursorSec) + pad)}
                 disabled={!file}
               >
                 ▶ Desde el cursor
@@ -1125,6 +1234,7 @@ export default function App() {
                 Carga un audio, coloca el marcador en el primer golpe real,
                 ajústalo al tempo de tu proyecto y descárgalo sincronizado.
               </div>
+              <div className="w95-label">· Lee los pulsos de toda la canción; si el tempo se mueve, alinea cada pulso a la rejilla</div>
               <div className="w95-label">· Estirado en un Web Worker: tres algoritmos, golpes anclados al compás</div>
               <div className="w95-label">· Estéreo intacto, misma frecuencia de muestreo</div>
               <div className="w95-label">· Sin normalizar, sin comprimir, sin efectos</div>

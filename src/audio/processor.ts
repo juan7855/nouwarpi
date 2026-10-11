@@ -1,8 +1,9 @@
-// Cliente del Web Worker de estirado. Un solo trabajo activo a la vez:
+// Cliente del Web Worker. Cada instancia ejecuta un solo trabajo a la vez:
 // lanzar uno nuevo (o llamar a cancel) termina el anterior.
 
 import StretchWorker from "./worker?worker&inline";
-import type { StretchMethod } from "./stretch";
+import type { StretchMethod, Anchor } from "./stretch";
+import type { BeatTrack } from "./tracker";
 
 export const CANCELLED = "cancelled";
 
@@ -11,18 +12,12 @@ export class Processor {
   private seq = 0;
   private reject: ((e: Error) => void) | null = null;
 
-  run(
-    channels: Float32Array[],
-    sampleRate: number,
-    factor: number,
-    method: StretchMethod,
-    onProgress: (frac: number) => void
-  ): Promise<Float32Array[]> {
+  private request<T>(msg: object, transfer: Transferable[], onProgress: (frac: number) => void): Promise<T> {
     this.cancel();
     const id = ++this.seq;
     const worker = new StretchWorker();
     this.worker = worker;
-    return new Promise<Float32Array[]>((resolve, reject) => {
+    return new Promise<T>((resolve, reject) => {
       this.reject = reject;
       worker.onmessage = (e: MessageEvent) => {
         const m = e.data;
@@ -30,7 +25,7 @@ export class Processor {
         if (m.type === "progress") onProgress(m.frac);
         else if (m.type === "done") {
           this.cleanup(worker);
-          resolve(m.channels);
+          resolve(m.result as T);
         } else if (m.type === "error") {
           this.cleanup(worker);
           reject(new Error(m.message));
@@ -40,8 +35,31 @@ export class Processor {
         this.cleanup(worker);
         reject(new Error(e.message || "Error en el worker"));
       };
-      worker.postMessage({ id, channels, sampleRate, factor, method }, channels.map((c) => c.buffer));
+      worker.postMessage({ ...msg, id }, transfer);
     });
+  }
+
+  // `warp`: factor constante, o anclas en MUESTRAS (in → out) para tempo variable
+  stretch(
+    channels: Float32Array[],
+    sampleRate: number,
+    warp: number | Anchor[],
+    method: StretchMethod,
+    onProgress: (frac: number) => void
+  ): Promise<Float32Array[]> {
+    return this.request<Float32Array[]>(
+      { type: "stretch", channels, sampleRate, warp, method },
+      channels.map((c) => c.buffer),
+      onProgress
+    );
+  }
+
+  track(mono: Float32Array, sampleRate: number, beatsPerBar: number, onProgress: (frac: number) => void): Promise<BeatTrack> {
+    return this.request<BeatTrack>(
+      { type: "track", channels: [mono], sampleRate, beatsPerBar },
+      [mono.buffer],
+      onProgress
+    );
   }
 
   cancel() {

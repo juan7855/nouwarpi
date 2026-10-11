@@ -12,29 +12,95 @@
 //                cambia el tono (como un vinilo).
 
 import { FFT, hannWindow } from "./dsp";
+import { fineFlux } from "./tracker";
+
+const TWO_PI = 2 * Math.PI;
 
 export type StretchMethod = "wsola" | "pvoc" | "resample";
 export type ProgressFn = (frac: number) => void;
 
-const TWO_PI = 2 * Math.PI;
+// Ancla del mapa de tiempo: la muestra `in` de la entrada debe acabar en la muestra `out`.
+export interface Anchor {
+  in: number;
+  out: number;
+}
+
+export interface WarpMap {
+  anchors: Anchor[];
+  outLen: number;
+  maxSlope: number; // mayor alargamiento local (salida/entrada)
+  minSlope: number;
+  fwd(x: number): number; // entrada → salida
+  inv(y: number): number; // salida → entrada
+}
+
+// Mapa lineal por tramos. Las anclas que no avanzan en ambos ejes se descartan.
+export function makeWarp(anchors: Anchor[]): WarpMap {
+  const a: Anchor[] = [];
+  for (const p of anchors) {
+    const last = a[a.length - 1];
+    if (!last || (p.in > last.in + 1 && p.out > last.out + 1)) a.push({ in: p.in, out: p.out });
+  }
+  if (a.length < 2) throw new Error("Mapa de tiempo inválido");
+  let maxSlope = 0;
+  let minSlope = Infinity;
+  for (let i = 1; i < a.length; i++) {
+    const sl = (a[i].out - a[i - 1].out) / (a[i].in - a[i - 1].in);
+    if (sl > maxSlope) maxSlope = sl;
+    if (sl < minSlope) minSlope = sl;
+  }
+  const seg = (v: number, key: "in" | "out") => {
+    let lo = 0;
+    let hi = a.length - 2;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (a[mid][key] <= v) lo = mid;
+      else hi = mid - 1;
+    }
+    return lo;
+  };
+  return {
+    anchors: a,
+    outLen: Math.max(1, Math.round(a[a.length - 1].out)),
+    maxSlope,
+    minSlope,
+    fwd(x) {
+      const i = seg(x, "in");
+      return a[i].out + ((x - a[i].in) * (a[i + 1].out - a[i].out)) / (a[i + 1].in - a[i].in);
+    },
+    inv(y) {
+      const i = seg(y, "out");
+      return a[i].in + ((y - a[i].out) * (a[i + 1].in - a[i].in)) / (a[i + 1].out - a[i].out);
+    },
+  };
+}
 
 export function stretchChannels(
   chs: Float32Array[],
   sr: number,
-  factor: number,
+  warp: number | Anchor[],
   method: StretchMethod,
   onProgress: ProgressFn = () => {}
 ): Float32Array[] {
   if (!chs.length || !chs[0].length) return chs;
-  if (!(factor > 0.05 && factor < 20)) throw new Error("Factor de tempo fuera de rango");
-  if (Math.abs(factor - 1) < 0.0005) return chs.map((c) => c.slice());
+  const inLen = chs[0].length;
+  if (typeof warp === "number") {
+    if (!(warp > 0.05 && warp < 20)) throw new Error("Factor de tempo fuera de rango");
+    if (Math.abs(warp - 1) < 0.0005) return chs.map((c) => c.slice());
+    warp = [
+      { in: 0, out: 0 },
+      { in: inLen, out: Math.round(inLen * warp) },
+    ];
+  }
+  const map = makeWarp(warp);
+  if (!(map.minSlope > 0.05 && map.maxSlope < 20)) throw new Error("Cambio de tempo fuera de rango");
   switch (method) {
     case "pvoc":
-      return phaseVocoder(chs, sr, factor, onProgress);
+      return phaseVocoder(chs, sr, map, onProgress);
     case "resample":
-      return resampleSinc(chs, factor, onProgress);
+      return resampleSinc(chs, map, onProgress);
     default:
-      return wsola(chs, sr, factor, onProgress);
+      return wsola(chs, sr, map, onProgress);
   }
 }
 
@@ -42,11 +108,10 @@ export function stretchChannels(
 /* Remuestreo sinc con ventana Blackman-Harris                          */
 /* ------------------------------------------------------------------ */
 
-function resampleSinc(chs: Float32Array[], factor: number, onProgress: ProgressFn): Float32Array[] {
+function resampleSinc(chs: Float32Array[], map: WarpMap, onProgress: ProgressFn): Float32Array[] {
   const inLen = chs[0].length;
-  const outLen = Math.max(1, Math.round(inLen * factor));
-  const step = inLen / outLen; // muestras de entrada por muestra de salida
-  const cutoff = Math.min(1, 1 / step); // filtro antialias al bajar la resolución
+  const outLen = map.outLen;
+  const cutoff = Math.min(1, map.minSlope); // filtro antialias donde se comprime
   const ZC = 16; // cruces por cero a cada lado
   const half = ZC / cutoff;
   const OS = 256; // sobremuestreo de la tabla
@@ -69,7 +134,7 @@ function resampleSinc(chs: Float32Array[], factor: number, onProgress: ProgressF
   const wts = new Float64Array(maxTaps);
 
   for (let j = 0; j < outLen; j++) {
-    const pos = j * step;
+    const pos = map.inv(j);
     const n0 = Math.ceil(pos - half);
     const n1 = Math.floor(pos + half);
     let wsum = 0;
@@ -100,39 +165,40 @@ function resampleSinc(chs: Float32Array[], factor: number, onProgress: ProgressF
 
 
 // Ataques de la señal (índices de muestra de entrada). Se usan para "anclar" los
-// golpes a su posición exacta (posición × factor) y que no se muevan al estirar.
+// golpes a su posición exacta en el mapa de tiempo y que no se dupliquen ni se muevan
+// al estirar. Usa el flujo espectral fino (distingue un bombo encima de un bajo sostenido).
 function detectOnsets(chs: Float32Array[], sr: number): number[] {
-  const B = 128;
-  const inLen = chs[0].length;
-  const nb = Math.floor(inLen / B);
-  if (nb < 4) return [];
-  const e = new Float64Array(nb);
-  let maxE = 0;
-  for (let b = 0; b < nb; b++) {
-    let s = 0;
-    for (const ch of chs) for (let i = b * B; i < (b + 1) * B; i++) s += ch[i] * ch[i];
-    e[b] = s;
-    if (s > maxE) maxE = s;
-  }
-  if (maxE <= 0) return [];
-  const minGap = Math.round(0.03 * sr);
+  const n = chs[0].length;
+  const mono = new Float32Array(n);
+  for (const c of chs) for (let i = 0; i < n; i++) mono[i] += c[i];
+  const fine = fineFlux(mono, sr);
+  const env = fine.env;
+  const nf = env.length;
+  if (nf < 16) return [];
+  const sample: number[] = [];
+  for (let i = 0; i < nf; i += 3) sample.push(env[i]);
+  sample.sort((a, b) => a - b);
+  const scale = sample[Math.floor(sample.length * 0.99)];
+  if (!(scale > 0)) return [];
+  const thr = Math.max(0.25 * scale, 1.5); // umbral absoluto: sin ataques reales no se ancla nada
+  const R = 6; // máximo local en ±6 fotogramas (~17 ms)
+  const minGap = Math.round(0.02 * sr);
   const out: number[] = [];
-  for (let b = 3; b < nb - 1; b++) {
-    const prev = (e[b - 1] + e[b - 2] + e[b - 3]) / 3;
-    if (e[b] > 4 * prev + 1e-9 && e[b] > 0.003 * maxE) {
-      let pk = 0;
-      for (const ch of chs) for (let i = b * B; i < (b + 2) * B && i < inLen; i++) pk = Math.max(pk, Math.abs(ch[i]));
-      let pos = b * B;
-      search: for (let i = b * B; i < (b + 2) * B && i < inLen; i++) {
-        for (const ch of chs) {
-          if (Math.abs(ch[i]) >= 0.2 * pk) {
-            pos = i;
-            break search;
-          }
-        }
+  for (let f = R; f < nf - R; f++) {
+    const v = env[f];
+    if (v < thr) continue;
+    let isMax = true;
+    for (let d = -R; d <= R; d++) {
+      if (env[f + d] > v || (env[f + d] === v && d < 0)) {
+        isMax = false;
+        break;
       }
-      if (!out.length || pos - out[out.length - 1] >= minGap) out.push(pos);
     }
+    if (!isMax) continue;
+    let st = f;
+    while (st > f - 10 && st > 1 && env[st - 1] >= 0.35 * v) st--;
+    const pos = Math.round((st * fine.hop) / sr * sr + fine.delay * sr);
+    if (!out.length || pos - out[out.length - 1] >= minGap) out.push(pos);
   }
   return out;
 }
@@ -141,10 +207,10 @@ function detectOnsets(chs: Float32Array[], sr: number): number[] {
 /* WSOLA (solapamiento y suma sincronizado por forma de onda)           */
 /* ------------------------------------------------------------------ */
 
-function wsola(chs: Float32Array[], sr: number, factor: number, onProgress: ProgressFn): Float32Array[] {
+function wsola(chs: Float32Array[], sr: number, map: WarpMap, onProgress: ProgressFn): Float32Array[] {
   const nCh = chs.length;
   const inLen = chs[0].length;
-  const outLen = Math.max(1, Math.round(inLen * factor));
+  const outLen = map.outLen;
 
   let W = Math.round(sr * 0.05); // ventana ≈ 50 ms
   if (W % 2) W++;
@@ -188,13 +254,28 @@ function wsola(chs: Float32Array[], sr: number, factor: number, onProgress: Prog
   const maxStart = pl - W - 1;
   let prevC = 0;
 
-  const onsetIn = detectOnsets(chs, sr);
-  const onsetOut = onsetIn.map((o) => Math.round(o * factor));
+  // anclas de transitorio: cada pulso del plan (si lo hay) + los ataques detectados
+  const beatPins = map.anchors.slice(1, -1).map((a) => Math.round(a.in)); // enteros: se usan como índice de muestra
+  const minGap = Math.round(0.015 * sr);
+  const pinList = beatPins.slice();
+  for (const o of detectOnsets(chs, sr)) {
+    let near = false;
+    for (const b of beatPins) {
+      if (Math.abs(b - o) < minGap) {
+        near = true;
+        break;
+      }
+    }
+    if (!near) pinList.push(o);
+  }
+  pinList.sort((a, b) => a - b);
+  const onsetIn = pinList;
+  const onsetOut = onsetIn.map((o) => Math.round(map.fwd(o)));
   let oi = 0;
 
   for (let k = 0; k <= K; k++) {
     // inicio nominal del fragmento (índice en el array con relleno)
-    const nom = Math.round((k * Hs) / factor - W / 2) + pad;
+    const nom = Math.round(map.inv(k * Hs) - W / 2) + pad;
     let c = nom;
     if (k > 0) {
       const tgt = prevC + Hs; // continuación natural del fragmento anterior
@@ -273,15 +354,15 @@ function wsola(chs: Float32Array[], sr: number, factor: number, onProgress: Prog
 /* Vocoder de fase con bloqueo de fase y reinicio en transitorios       */
 /* ------------------------------------------------------------------ */
 
-function phaseVocoder(chs: Float32Array[], sr: number, factor: number, onProgress: ProgressFn): Float32Array[] {
+function phaseVocoder(chs: Float32Array[], sr: number, map: WarpMap, onProgress: ProgressFn): Float32Array[] {
   const nCh = chs.length;
   const inLen = chs[0].length;
-  const outLen = Math.max(1, Math.round(inLen * factor));
+  const outLen = map.outLen;
 
   const N = inLen > 90 * sr ? 2048 : 4096;
   const half = N / 2;
   // el hop de síntesis nunca supera N/4 (solape suficiente al ralentizar mucho)
-  const HA = Math.max(64, Math.floor(N / 4 / Math.max(1, factor)));
+  const HA = Math.max(64, Math.floor(N / 4 / Math.max(1, map.maxSlope)));
   const frames = Math.ceil(inLen / HA) + 2;
 
   const win = hannWindow(N);
@@ -319,8 +400,8 @@ function phaseVocoder(chs: Float32Array[], sr: number, factor: number, onProgres
   for (let fi = 0; fi < frames; fi++) {
     const inCenter = fi * HA;
     const start = inCenter - half;
-    const synCenter = Math.round(fi * HA * factor);
-    const hop = fi === 0 ? HA * factor : synCenter - prevCenter;
+    const synCenter = Math.round(map.fwd(inCenter));
+    const hop = fi === 0 ? HA : Math.max(1, synCenter - prevCenter);
     prevCenter = synCenter;
 
     // 1) análisis de todos los canales + flujo espectral conjunto
