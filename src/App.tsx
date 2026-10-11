@@ -672,6 +672,22 @@ export default function App() {
     setScrollBar(1 - markerSec / origBeatLen);
   }, [file, origBeatLen, markerSec]);
 
+  // Estefa: activar / desactivar (vuelve al modo que sugirió el análisis)
+  const toggleEstefa = useCallback(() => {
+    if (!track) {
+      setStatus(analyzing ? "Espera: aún analizando el audio…" : "Carga un audio primero para usar Estefa");
+      return;
+    }
+    setEstefaPick(0);
+    if (tempoMode === "estefa") {
+      setTempoMode(track.constantOk ? "const" : "var");
+      setStatus("Estefa desactivada");
+    } else {
+      setTempoMode("estefa");
+      setStatus("Estefa activada: decide el tempo natural y cuantiza los sonidos");
+    }
+  }, [track, analyzing, tempoMode]);
+
   const bumpTempo = useCallback((k: 2 | 0.5) => {
     setBeatMult((m) => (m * k === 2 ? 2 : m * k === 0.5 ? 0.5 : m * k === 1 ? 1 : m));
     setOriginalBPM((v) => Math.min(300, Math.max(30, Math.round(v * k * 100) / 100)));
@@ -780,6 +796,14 @@ export default function App() {
       >
         <span className="menu-item" onClick={() => fileInputRef.current?.click()}>
           Cargar audio…
+        </span>
+        <span
+          className="menu-item"
+          onClick={toggleEstefa}
+          title="Sincroniza audio SIN BPM fijo: Estefa decide el tempo natural y cuantiza los sonidos"
+          style={tempoMode === "estefa" ? { background: "#000080", color: "#ffffff", fontWeight: "bold" } : { fontWeight: "bold" }}
+        >
+          ★ Estefa{tempoMode === "estefa" ? " (activa)" : ""}
         </span>
         <span className="menu-item" onClick={() => setAboutOpen(true)}>
           Acerca de
@@ -1043,7 +1067,7 @@ export default function App() {
         <Win95Window
           title="Ajustes"
           draggable
-          defaultPos={{ x: 8, y: 200 }}
+          defaultPos={{ x: 8, y: 410 }}
           width={350}
           zIndex={focus === "ajustes" ? 60 : 10}
           onFocus={() => setFocus("ajustes")}
@@ -1051,6 +1075,21 @@ export default function App() {
           <div className="flex flex-col gap-3">
             <div>
               <div className="w95-group-title">Tempo</div>
+              <W95Button
+                onClick={toggleEstefa}
+                disabled={!file}
+                title="Sincroniza audio sin BPM fijo"
+                style={{
+                  width: "100%",
+                  marginBottom: 6,
+                  fontWeight: "bold",
+                  ...(tempoMode === "estefa" ? { background: "#000080", color: "#ffffff" } : {}),
+                }}
+              >
+                {tempoMode === "estefa"
+                  ? "★ Estefa ACTIVA — clic para desactivar"
+                  : "★ Estefa: sincronizar sin BPM (automático)"}
+              </W95Button>
               <div className="flex items-center gap-2 flex-wrap">
                 <span className="w95-label" style={{ width: 105, flex: "0 0 auto" }}>
                   BPM del proyecto:
