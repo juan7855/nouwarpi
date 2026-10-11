@@ -13,9 +13,11 @@ export function Win95Window(props: {
   draggable?: boolean;
   defaultPos?: { x: number; y: number };
   width?: number | string;
+  id?: string;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState(props.defaultPos ?? { x: 24, y: 24 });
+  const [widthOv, setWidthOv] = useState<number | null>(null);
   const [minimized, setMinimized] = useState(false);
   const [maximized, setMaximized] = useState(false);
   const drag = useRef<{ dx: number; dy: number } | null>(null);
@@ -44,6 +46,22 @@ export function Win95Window(props: {
     window.dispatchEvent(new Event("w95-layout"));
   });
 
+  // "Ordenar": la app coloca cada ventana en su sitio (evento w95-arrange con {id: {x, y, width}})
+  useEffect(() => {
+    if (!props.id) return;
+    const id = props.id;
+    const onArrange = (e: Event) => {
+      const d = (e as CustomEvent).detail?.[id];
+      if (!d) return;
+      setPos({ x: d.x, y: d.y });
+      setWidthOv(d.width ?? null);
+      setMaximized(false);
+      setMinimized(false);
+    };
+    window.addEventListener("w95-arrange", onArrange);
+    return () => window.removeEventListener("w95-arrange", onArrange);
+  }, [props.id]);
+
   const onPointerDown = (e: React.PointerEvent) => {
     props.onFocus?.();
     if (!props.draggable || maximized || isMobile()) return;
@@ -53,9 +71,14 @@ export function Win95Window(props: {
     const r = el.getBoundingClientRect();
     drag.current = { dx: e.clientX - r.left, dy: e.clientY - r.top };
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    window.dispatchEvent(new Event("w95-userdrag")); // el usuario coloca a mano: la app deja de reordenar sola
   };
   const onPointerMove = (e: React.PointerEvent) => {
     if (!drag.current) return;
+    if (e.buttons === 0) {
+      drag.current = null; // se soltó el botón sin que llegara el evento: no seguir arrastrando
+      return;
+    }
     const el = ref.current;
     const parent = el?.offsetParent as HTMLElement | null;
     if (!el || !parent) return;
@@ -77,6 +100,7 @@ export function Win95Window(props: {
     <div
       ref={ref}
       className="w95-window"
+      data-win={props.id}
       style={{
         ...(!floating
           ? { position: "static", width: "100%", marginBottom: 14 }
@@ -86,7 +110,7 @@ export function Win95Window(props: {
                 position: "absolute",
                 left: pos.x,
                 top: pos.y,
-                width: props.width ?? 420,
+                width: widthOv ?? props.width ?? 420,
                 maxWidth: "100%",
                 zIndex: props.zIndex ?? 1,
               }),
@@ -99,6 +123,7 @@ export function Win95Window(props: {
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
+        onPointerCancel={onPointerUp}
         onDoubleClick={() => floating && setMaximized((m) => !m)}
       >
         <span className="w95-titlebar-text">{props.title}</span>
@@ -306,26 +331,49 @@ export function HScrollbar(props: {
   page?: number;
 }) {
   const trackRef = useRef<HTMLDivElement>(null);
-  const drag = useRef<{ startX: number; startVal: number } | null>(null);
+  const drag = useRef<{ kind: "thumb" | "track"; startX: number; startVal: number } | null>(null);
   const range = Math.max(1e-6, props.max - props.min);
-  const page = Math.min(range, props.page ?? range * 0.25);
-  const thumbW = Math.max(16, (page / range) * 100);
-  const frac = Math.max(0, Math.min(1, (props.value - props.min) / Math.max(1e-6, range - page)));
+  const page = Math.min(range, Math.max(1e-4, props.page ?? range * 0.25));
+  // el borde izquierdo no puede pasar de aquí: la barra NUNCA se va más allá del contenido
+  const top = Math.max(props.min, props.max - page);
+  const clampV = (v: number) => Math.max(props.min, Math.min(top, v));
+  const thumbW = Math.max(6, Math.min(100, (page / range) * 100));
+  const frac = Math.max(0, Math.min(1, (props.value - props.min) / Math.max(1e-6, top - props.min)));
   const thumbLeft = frac * (100 - thumbW);
 
+  const end = () => {
+    drag.current = null;
+  };
   const valFromX = (clientX: number) => {
     const track = trackRef.current;
     if (!track) return props.value;
     const r = track.getBoundingClientRect();
-    const f = (clientX - r.left) / r.width;
-    return props.min + f * (range - page);
+    const f = Math.max(0, Math.min(1, (clientX - r.left) / Math.max(1, r.width)));
+    return clampV(props.min + f * (top - props.min));
+  };
+  const onMove = (e: React.PointerEvent) => {
+    const d = drag.current;
+    if (!d) return;
+    if (e.buttons === 0) {
+      end(); // soltaste el botón fuera de la barra: dejar de seguir al ratón
+      return;
+    }
+    const track = trackRef.current;
+    if (!track) return;
+    if (d.kind === "track") {
+      props.onChange(valFromX(e.clientX));
+    } else {
+      const r = track.getBoundingClientRect();
+      const usable = Math.max(1, r.width * (1 - thumbW / 100));
+      props.onChange(clampV(d.startVal + ((e.clientX - d.startX) / usable) * (top - props.min)));
+    }
   };
 
   return (
     <div className="w95-hscroll">
       <button
         className="w95-scroll-btn"
-        onClick={() => props.onChange(Math.max(props.min, props.value - 1))}
+        onClick={() => props.onChange(clampV(props.value - page * 0.25))}
         tabIndex={-1}
       >
         ◀
@@ -334,39 +382,29 @@ export function HScrollbar(props: {
         ref={trackRef}
         className="w95-scroll-track"
         onPointerDown={(e) => {
-          (e.target as HTMLElement).setPointerCapture(e.pointerId);
+          (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
           const v = valFromX(e.clientX);
           props.onChange(v);
-          drag.current = { startX: e.clientX, startVal: v };
+          drag.current = { kind: "track", startX: e.clientX, startVal: v };
         }}
-        onPointerMove={(e) => {
-          if (!drag.current) return;
-          props.onChange(valFromX(e.clientX));
-        }}
-        onPointerUp={() => (drag.current = null)}
+        onPointerMove={onMove}
+        onPointerUp={end}
+        onPointerCancel={end}
+        onLostPointerCapture={end}
       >
         <div
           className="w95-scroll-thumb"
           style={{ left: `${thumbLeft}%`, width: `${thumbW}%` }}
           onPointerDown={(e) => {
             e.stopPropagation();
-            (e.target as HTMLElement).setPointerCapture(e.pointerId);
-            drag.current = { startX: e.clientX, startVal: props.value };
+            (e.currentTarget.parentElement as HTMLElement).setPointerCapture(e.pointerId);
+            drag.current = { kind: "thumb", startX: e.clientX, startVal: clampV(props.value) };
           }}
-          onPointerMove={(e) => {
-            if (!drag.current) return;
-            const track = trackRef.current;
-            if (!track) return;
-            const r = track.getBoundingClientRect();
-            const dBars = ((e.clientX - drag.current.startX) / r.width) * (range - page);
-            props.onChange(drag.current.startVal + dBars);
-          }}
-          onPointerUp={() => (drag.current = null)}
         />
       </div>
       <button
         className="w95-scroll-btn"
-        onClick={() => props.onChange(Math.min(props.max, props.value + 1))}
+        onClick={() => props.onChange(clampV(props.value + page * 0.25))}
         tabIndex={-1}
       >
         ▶

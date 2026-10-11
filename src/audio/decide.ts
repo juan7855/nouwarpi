@@ -15,7 +15,7 @@ export function firstDownbeat(tr: BeatTrack, bpb: number): number {
   if (i < 0) i = 0;
   // con todos los pulsos iguales (p. ej. un bombo en cada negra) no hay forma de saber cuál es el
   // tiempo fuerte: se usa el primer golpe audible, que es lo que se espera
-  if (tr.downbeatMargin >= 0.3) {
+  if (tr.downbeatMargin >= 0.6) {
     for (let n = 0; n < bpb && i < beats.length - 1; n++) {
       if ((((i - tr.downbeatPhase) % bpb) + bpb) % bpb === 0) break;
       i++;

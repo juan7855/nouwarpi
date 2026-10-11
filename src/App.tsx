@@ -135,6 +135,8 @@ export default function App() {
     const nv = typeof v === "function" ? v(cur) : v;
     if (marksRef.current.length) setMarks([nv, ...marksRef.current.slice(1)].sort((a, b) => a - b));
     else setAutoMarker(nv);
+    // la rejilla se re-ancla en el "1": se compensa el desplazamiento para que la vista no salte
+    if (beatLenRef.current > 0) setScrollRaw((sc) => sc + (cur - nv) / beatLenRef.current);
   }, []);
   const [cursorSec, setCursorSec] = useState(0);
   const [projectBPM, setProjectBPM] = useState(120);
@@ -171,7 +173,19 @@ export default function App() {
   const [clipWarn, setClipWarn] = useState<number | null>(null);
   const [detected, setDetected] = useState<{ firstBeat: number; bpm: number; conf: number } | null>(null);
   const [zoom, setZoom] = useState(160);
-  const [scrollBar, setScrollBar] = useState(0);
+  const [scrollBar, setScrollRaw] = useState(0);
+  // la vista nunca puede irse más allá del contenido (antes se perdía "al infinito")
+  const scrollLimits = useRef({ min: -4, max: 100 });
+  const setScrollBar = useCallback((v: number) => {
+    const { min, max } = scrollLimits.current;
+    setScrollRaw(Math.max(min, Math.min(max, v)));
+  }, []);
+  const beatLenRef = useRef(0.5);
+  // modo de clic en la onda y audición al colocar el "1"
+  const [markMode, setMarkMode] = useState<"first" | "beats">("first");
+  const [auditionOn, setAuditionOn] = useState(true);
+  const [auditionReq, setAuditionReq] = useState(0);
+  const auditionTok = useRef(0);
   const [focus, setFocus] = useState("wave");
   const mainRef = useRef<HTMLElement>(null);
 
@@ -195,9 +209,67 @@ export default function App() {
     };
   }, []);
   const [aboutOpen, setAboutOpen] = useState(false);
+
+  // colocación automática: cada ventana en su sitio, sin solaparse (hasta que el usuario mueva alguna)
+  const userMovedRef = useRef(false);
+  useEffect(() => {
+    const h = () => {
+      userMovedRef.current = true;
+    };
+    window.addEventListener("w95-userdrag", h);
+    return () => window.removeEventListener("w95-userdrag", h);
+  }, []);
+  const arrangeWindows = useCallback((force?: boolean) => {
+    if (force) userMovedRef.current = false;
+    if (userMovedRef.current) return;
+    const main = mainRef.current;
+    if (!main) return;
+    const W = main.clientWidth;
+    if (W < 820) return;
+    const hOf = (id: string) => (main.querySelector(`[data-win="${id}"]`) as HTMLElement | null)?.offsetHeight ?? 300;
+    const GAP = 10;
+    const c1 = 350;
+    const det: Record<string, { x: number; y: number; width?: number }> = {};
+    det.file = { x: 8, y: 8, width: c1 };
+    det.ajustes = { x: 8, y: 8 + hOf("file") + GAP, width: c1 };
+    const x2 = 8 + c1 + GAP;
+    const wide = W >= 1450;
+    const waveW = Math.max(560, Math.min(820, W - x2 - (wide ? 330 + GAP + 8 : 8)));
+    det.wave = { x: x2, y: 8, width: waveW };
+    const y2 = 8 + hOf("wave") + GAP;
+    det.repro = { x: x2, y: y2, width: 400 };
+    if (wide) det.export = { x: x2 + waveW + GAP, y: 8, width: 330 };
+    else if (x2 + 400 + GAP + 330 <= W - 8) det.export = { x: x2 + 400 + GAP, y: y2, width: 330 };
+    else det.export = { x: x2, y: y2 + hOf("repro") + GAP, width: 330 };
+    window.dispatchEvent(new CustomEvent("w95-arrange", { detail: det }));
+  }, []);
   const [dropHover, setDropHover] = useState(false);
   const [tapCount, setTapCount] = useState(0);
   const [exportBusy, setExportBusy] = useState(false);
+
+  // se reordena al abrir, al cargar un audio, al cambiar de modo (cambia la altura de Ajustes) y al redimensionar
+  useEffect(() => {
+    const run = () => {
+      arrangeWindows();
+      // la altura cambia al fijar el ancho: segunda pasada
+      setTimeout(() => arrangeWindows(), 80);
+    };
+    const t1 = setTimeout(run, 40);
+    const t2 = setTimeout(run, 400);
+    return () => {
+      clearTimeout(t1);
+      clearTimeout(t2);
+    };
+  }, [file, track, tempoMode, arrangeWindows]);
+  useEffect(() => {
+    let t: number | undefined;
+    const onResize = () => {
+      window.clearTimeout(t);
+      t = window.setTimeout(() => arrangeWindows(), 150);
+    };
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, [arrangeWindows]);
 
   const stretchedRef = useRef<AudioBuffer | null>(null);
   const procToken = useRef(0);
@@ -313,6 +385,16 @@ export default function App() {
   const tempoWarn = Math.abs(tempoChangePct) > 25;
 
   const markerOut = pad + markerStretched; // el marcador, siempre en una línea de compás
+
+  beatLenRef.current = origBeatLen;
+  {
+    // rango de desplazamiento (en pulsos desde el "1"): de t = 0 al final, en ambas vistas
+    const topMin = 1 - markerSec / origBeatLen - 1;
+    const topMax = file ? (file.duration - markerSec) / origBeatLen + 1 : 100;
+    const outMin = -markerOut / beatLen - 1;
+    const outMax = file ? (totalOut - markerOut) / beatLen + 1 : 100;
+    scrollLimits.current = { min: file ? Math.min(topMin, outMin) : -4, max: file ? Math.max(topMax, outMax) : 100 };
+  }
 
   const exportPlan = useMemo(() => {
     if (!file) return null;
@@ -482,6 +564,7 @@ export default function App() {
   /* ---------- reproducción ---------- */
 
   const stopPlayback = useCallback(() => {
+    auditionTok.current++;
     engineRef.current!.stop();
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
     rafRef.current = 0;
@@ -569,11 +652,14 @@ export default function App() {
   );
 
   // Reproduce una fuente. Si ya está sonando la otra, CAMBIA en la misma posición musical (A/B).
+  // Parado, SIEMPRE arranca desde el 1 (rojo). Si ya está sonando, cambia de fuente en la misma posición
+  // (A/B). `from = "cursor"` fuerza el cursor amarillo.
   const playSource = useCallback(
-    (mode: "adj" | "orig") => {
+    (mode: "adj" | "orig", from?: "cursor") => {
       if (!file) return;
-      const from = playing || cursorSec > 0.001 ? plan.fwd(cursorSec) + pad : markerOut;
-      startPlayback(mode, from);
+      auditionTok.current++;
+      const start = from === "cursor" || playing ? plan.fwd(cursorSec) + pad : markerOut;
+      startPlayback(mode, start);
     },
     [file, playing, cursorSec, plan, pad, markerOut, startPlayback]
   );
@@ -633,6 +719,18 @@ export default function App() {
     setAutoMarker(fb);
     setStatus("Primer tiempo fuerte: " + fb.toFixed(3) + " s");
   }, [file, track, beatsPerBar]);
+
+  // al colocar el "1": se oye un fragmento del ORIGINAL desde ahí para comprobar que es el golpe
+  useEffect(() => {
+    if (!auditionReq || !file) return;
+    const tok = ++auditionTok.current;
+    startPlayback("orig", markerOut);
+    const t = setTimeout(() => {
+      if (auditionTok.current === tok) stopPlayback();
+    }, 1300);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [auditionReq]);
 
   /* ---------- marcas con clics ---------- */
 
@@ -857,6 +955,9 @@ export default function App() {
         >
           ★ Estefa{tempoMode === "estefa" ? " (activa)" : ""}
         </span>
+        <span className="menu-item" onClick={() => arrangeWindows(true)} title="Coloca cada ventana en su sitio">
+          ▦ Ordenar ventanas
+        </span>
         <span className="menu-item" onClick={() => setAboutOpen(true)}>
           Acerca de
         </span>
@@ -869,6 +970,7 @@ export default function App() {
       <main ref={mainRef} className="px-2 pt-3 relative" style={{ minHeight: 700 }}>
         {/* ---- Archivo ---- */}
         <Win95Window
+          id="file"
           title="Archivo"
           draggable
           defaultPos={{ x: 8, y: 8 }}
@@ -962,6 +1064,7 @@ export default function App() {
 
         {/* ---- Forma de onda ---- */}
         <Win95Window
+          id="wave"
           title="Forma de onda"
           draggable
           defaultPos={{ x: 374, y: 8 }}
@@ -1002,6 +1105,25 @@ export default function App() {
               <span className="w95-label mono">
                 Cursor: {cursorSec.toFixed(4)} s
               </span>
+            </div>
+
+            {/* qué hace un clic en la onda */}
+            <div className="flex items-center gap-3 flex-wrap">
+              <span className="w95-label" style={{ fontWeight: "bold" }}>Clic en la onda:</span>
+              <W95Radio
+                checked={markMode === "first"}
+                onChange={() => setMarkMode("first")}
+                label="Poner el 1 (primer golpe)"
+              />
+              <W95Radio
+                checked={markMode === "beats"}
+                onChange={() => {
+                  setMarkMode("beats");
+                  if (!marksRef.current.length) setMarks([markerSec]); // el 1 actual pasa a ser la marca 1
+                }}
+                label="Marcar pulsos"
+              />
+              <W95Checkbox checked={auditionOn} onChange={setAuditionOn} label="Oír al poner el 1" />
             </div>
 
             {/* ajuste fino del marcador */}
@@ -1071,6 +1193,11 @@ export default function App() {
               totalBars={origBars}
               markerSec={markerSec}
               marks={marks}
+              markMode={markMode}
+              onSetMarker={(t) => file && setMarkerSec(clampMarker(t, file.duration))}
+              onMarkerCommit={() => auditionOn && setAuditionReq((n) => n + 1)}
+              scrollMin={scrollLimits.current.min}
+              scrollMax={scrollLimits.current.max}
               ticks={track ? track.beats : undefined}
               ticksGood={track ? track.beatGood : undefined}
               snapTimes={snapTimes}
@@ -1102,6 +1229,8 @@ export default function App() {
               totalBars={outBars}
               markerSec={markerOut}
               peaksOffset={pad}
+              scrollMin={scrollLimits.current.min}
+              scrollMax={scrollLimits.current.max}
               marks={marks.map((m) => plan.fwd(m) + pad)}
               ticks={track ? track.beats.map((b) => plan.fwd(b) + pad) : undefined}
               ticksGood={track ? track.beatGood : undefined}
@@ -1119,20 +1248,22 @@ export default function App() {
 
             <HScrollbar
               value={scrollBar}
-              min={-30}
-              max={Math.max(origBars, outBars) * beatsPerBar + 30}
+              min={scrollLimits.current.min}
+              max={scrollLimits.current.max}
               onChange={setScrollBar}
-              page={Math.max(4, 620 / zoom)}
+              page={Math.max(1, 620 / zoom)}
             />
             <div className="w95-label" style={{ color: "#404040" }}>
-              Rueda = zoom · clic = poner marca (se pega al golpe; Alt = sin imán) · clic en una marca =
-              quitarla · arrastrar una marca = moverla · Mayús+arrastrar = desplazar
+{markMode === "first"
+                ? "Clic = poner el 1 (se pega al golpe) · arrastra el rojo para afinar · franja inferior = mover el cursor amarillo · Alt = sin imán · Rueda = zoom · Mayús+arrastrar = desplazar"
+                : "Clic = añadir marca de pulso · clic en una marca naranja = quitarla · arrástrala para moverla · franja inferior = cursor · Alt = sin imán · Rueda = zoom"}
             </div>
           </div>
         </Win95Window>
 
         {/* ---- Ajustes ---- */}
         <Win95Window
+          id="ajustes"
           title="Ajustes"
           draggable
           defaultPos={{ x: 8, y: 410 }}
@@ -1391,6 +1522,7 @@ export default function App() {
 
         {/* ---- Reproducción ---- */}
         <Win95Window
+          id="repro"
           title="Reproducción"
           draggable
           defaultPos={{ x: 374, y: 664 }}
@@ -1449,12 +1581,12 @@ export default function App() {
               </W95Button>
             </div>
             <div className="w95-label" style={{ color: "#404040" }}>
-              Mientras suena, pulsa el otro botón para cambiar en la misma posición (A/B). Teclas: Espacio =
-              reproducir/parar · 1 = original · 2 = sincronizada.
+              Parado, arranca siempre desde el 1 (rojo). Mientras suena, pulsa el otro botón para cambiar en la
+              misma posición (A/B). Teclas: Espacio = reproducir/parar · 1 = original · 2 = sincronizada.
             </div>
             <div className="flex gap-2 flex-wrap">
-              <W95Button onClick={() => file && startPlayback(sourceMode, markerOut)} disabled={!file}>
-                ⏮ Desde el primer golpe
+              <W95Button onClick={() => playSource(sourceMode, "cursor")} disabled={!file} title="Desde el cursor amarillo">
+                ▶ Desde el cursor (amarillo)
               </W95Button>
             </div>
             <W95Checkbox
@@ -1494,6 +1626,7 @@ export default function App() {
 
         {/* ---- Exportar ---- */}
         <Win95Window
+          id="export"
           title="Exportar"
           draggable
           defaultPos={{ x: window.innerWidth >= 1420 ? 1030 : 740, y: window.innerWidth >= 1420 ? 8 : 664 }}
@@ -1585,7 +1718,7 @@ export default function App() {
               <div className="w95-label">· Lee los pulsos de toda la canción; si el tempo se mueve, alinea cada pulso a la rejilla</div>
               <div className="w95-label">· Comparador A/B: ORIGINAL / SINCRONIZADA con indicador y cambio en caliente (teclas 1 y 2)</div>
               <div className="w95-label">· El tempo se lee con el cuerpo de la música (no los charleys) y se elige la octava más cercana al proyecto</div>
-              <div className="w95-label">· Marcas con clics: se pegan al golpe, se quitan con otro clic; con 2 o más, tus marcas son los pulsos</div>
+              <div className="w95-label">· Un clic pone el 1 (rojo, se pega al golpe y se oye al instante); el cursor amarillo se mueve en la franja inferior; modo "Marcar pulsos" para marcas manuales</div>
               <div className="w95-label">· Estefa: sin BPM de origen, decide el tempo natural y cuantiza elásticamente cada sonido</div>
               <div className="w95-label">· Estirado en un Web Worker: tres algoritmos, golpes anclados al compás</div>
               <div className="w95-label">· Estéreo intacto, misma frecuencia de muestreo</div>

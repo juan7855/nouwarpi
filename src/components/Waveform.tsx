@@ -24,6 +24,11 @@ interface Props {
   ticks?: number[]; // pulsos que el algoritmo detectó (s, dominio de esta vista): marcas cian en el borde superior
   ticksGood?: boolean[]; // true = sobre un ataque real; false = extrapolado
   peaksOffset?: number; // segundos que la onda está desplazada en esta vista (relleno de silencio inicial)
+  markMode?: "first" | "beats"; // "first": un clic mueve el "1"; "beats": un clic añade una marca de pulso
+  onSetMarker?: (t: number) => void; // mueve el "1" (rojo)
+  onMarkerCommit?: () => void; // el usuario terminó de colocar el "1" (soltó el botón)
+  scrollMin?: number;
+  scrollMax?: number;
   editable?: boolean; // true: clic = poner/quitar marcas. false: clic = mover el cursor
   onAddMark?: (t: number) => void;
   onRemoveMark?: (t: number) => void;
@@ -42,6 +47,7 @@ interface Props {
 export const ZOOM_MIN = 2; // px por pulso (vista de toda la canción)
 export const ZOOM_MAX = 20000; // px por pulso (precisión de muestra)
 
+const CURSOR_STRIP = 18; // alto (px) de la franja inferior del cursor
 const MARK = "#ff8000";
 const GREEN = "#00ff00";
 const GREEN_DIM = "#005a00";
@@ -56,7 +62,7 @@ export function Waveform(props: Props) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const drag = useRef<
     | { mode: "mark"; cur: number; moved: boolean; startX: number }
-    | { mode: "auto"; startX: number }
+    | { mode: "marker"; startX: number }
     | { mode: "cursor" | "pan"; startX: number; startVal: number }
     | null
   >(null);
@@ -205,6 +211,16 @@ export function Waveform(props: Props) {
       ctx.fillText("1", mx + 4, 24);
     }
 
+    // franja inferior: aquí se mueve el cursor amarillo (reproducción)
+    ctx.fillStyle = "#0b1418";
+    ctx.fillRect(0, H - CURSOR_STRIP, W, CURSOR_STRIP);
+    ctx.strokeStyle = "#2a3a40";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(0, H - CURSOR_STRIP + 0.5);
+    ctx.lineTo(W, H - CURSOR_STRIP + 0.5);
+    ctx.stroke();
+
     // pulsos detectados por el algoritmo (cian = sobre un ataque real; gris = extrapolado)
     if (props.ticks) {
       const tk = props.ticks;
@@ -238,7 +254,7 @@ export function Waveform(props: Props) {
     });
 
     // vista previa: dónde caería la marca si haces clic (imán a los ataques)
-    if (hoverT !== null && props.editable !== false) {
+    if (hoverT !== null && props.editable !== false && Math.abs(timeToX(hoverT) - timeToX(markerSec)) > 3) {
       const hx = timeToX(hoverT);
       ctx.strokeStyle = "#ffffff";
       ctx.lineWidth = 1;
@@ -269,12 +285,21 @@ export function Waveform(props: Props) {
     zoom, scrollBar, height, xToTime, timeToX, tick, hoverT, props.marks, props.beatTimes, props.beatZero, props.peaksOffset, props.ticks, props.ticksGood,
   ]);
 
-  // redibujar al redimensionar
+  // redibujar al redimensionar la ventana del navegador o la propia ventana de la onda
   useEffect(() => {
     const onResize = () => setTick((t) => t + 1);
     window.addEventListener("resize", onResize);
-    return () => window.removeEventListener("resize", onResize);
+    const wrap = wrapRef.current;
+    const ro = wrap && typeof ResizeObserver !== "undefined" ? new ResizeObserver(onResize) : null;
+    if (wrap && ro) ro.observe(wrap);
+    return () => {
+      window.removeEventListener("resize", onResize);
+      ro?.disconnect();
+    };
   }, []);
+
+  const clampScroll = (v: number) =>
+    Math.max(props.scrollMin ?? -4, Math.min(props.scrollMax ?? totalBars * beatsPerBar + 4, v));
 
   // rueda del ratón → zoom proporcional alrededor del puntero (Mayús + rueda = desplazar)
   useEffect(() => {
@@ -286,7 +311,7 @@ export function Waveform(props: Props) {
       const rect = wrap.getBoundingClientRect();
       const mx = e.clientX - rect.left;
       if (e.shiftKey) {
-        props.onScrollChange?.(Math.max(-60, Math.min(totalBars * beatsPerBar + 60, scrollBar + dy / zoom)));
+        props.onScrollChange?.(clampScroll(scrollBar + dy / zoom));
         return;
       }
       const tAnchor = xToTime(mx);
@@ -294,7 +319,7 @@ export function Waveform(props: Props) {
       if (newZoom === zoom) return;
       props.onZoomChange?.(newZoom);
       const newScroll = 1 + (tAnchor - originSec) / beatLenSec - mx / newZoom;
-      props.onScrollChange?.(Math.max(-60, Math.min(totalBars * beatsPerBar + 60, newScroll)));
+      props.onScrollChange?.(clampScroll(newScroll));
     };
     wrap.addEventListener("wheel", onWheel, { passive: false });
     return () => wrap.removeEventListener("wheel", onWheel);
@@ -328,40 +353,61 @@ export function Waveform(props: Props) {
     return null;
   };
 
+  const endDrag = () => {
+    const d = drag.current;
+    drag.current = null;
+    if (!d) return;
+    if (d.mode === "mark" && !d.moved) props.onRemoveMark?.(d.cur); // clic sobre una marca = quitarla
+    if (d.mode === "marker") props.onMarkerCommit?.();
+  };
+
   const onPointerDown = (e: React.PointerEvent) => {
     const wrap = wrapRef.current;
     if (!wrap) return;
     if (e.button === 2) return; // clic derecho: se gestiona en onContextMenu
     const rect = wrap.getBoundingClientRect();
     const x = e.clientX - rect.left;
-    (e.target as HTMLElement).setPointerCapture(e.pointerId);
+    const y = e.clientY - rect.top;
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    setHoverT(null);
     if (e.button === 1 || e.shiftKey) {
       drag.current = { mode: "pan", startX: x, startVal: scrollBar };
       return;
     }
     const editable = props.editable !== false;
-    const cX = timeToX(cursorSec);
-    if (editable) {
-      const m = markAt(x);
-      if (m !== null) {
-        drag.current = { mode: "mark", cur: m, moved: false, startX: x };
-        return;
-      }
-      if (!(props.marks && props.marks.length) && Math.abs(x - timeToX(markerSec)) <= 7) {
-        drag.current = { mode: "auto", startX: x }; // el marcador automático: al moverlo pasa a ser una marca
-        return;
-      }
-      if (Math.abs(x - cX) < 8) {
-        drag.current = { mode: "cursor", startX: x, startVal: cursorSec };
-        return;
-      }
-      // clic en vacío: poner una marca (pegada al ataque más cercano; Alt = sin imán)
-      props.onAddMark?.(Math.max(0, snap(xToTime(x), 14, e.altKey)));
+    if (!editable) {
+      // vista sincronizada: clic = colocar el cursor de reproducción
+      const t = Math.max(0, xToTime(x));
+      props.onCursorChange?.(t);
+      drag.current = { mode: "cursor", startX: x, startVal: t };
       return;
     }
-    // vista ajustada: clic = colocar el cursor de reproducción
-    props.onCursorChange?.(Math.max(0, xToTime(x)));
-    drag.current = { mode: "cursor", startX: x, startVal: Math.max(0, xToTime(x)) };
+    // 1) el "1" rojo (siempre se puede agarrar y arrastrar)
+    if (Math.abs(x - timeToX(markerSec)) <= 9) {
+      drag.current = { mode: "marker", startX: x };
+      return;
+    }
+    // 2) marcas naranjas de pulso
+    const m = markAt(x);
+    if (m !== null) {
+      drag.current = { mode: "mark", cur: m, moved: false, startX: x };
+      return;
+    }
+    // 3) franja inferior = cursor amarillo
+    if (y >= (props.height ?? 170) - CURSOR_STRIP) {
+      const t = Math.max(0, xToTime(x));
+      props.onCursorChange?.(t);
+      drag.current = { mode: "cursor", startX: x, startVal: t };
+      return;
+    }
+    // 4) clic en la onda: poner el "1" (modo normal) o una marca de pulso (modo pulsos)
+    const t = Math.max(0, snap(xToTime(x), 14, e.altKey));
+    if (props.markMode === "beats") {
+      props.onAddMark?.(t);
+      return;
+    }
+    props.onSetMarker?.(t);
+    drag.current = { mode: "marker", startX: x };
   };
 
   const onPointerMove = (e: React.PointerEvent) => {
@@ -369,37 +415,35 @@ export function Waveform(props: Props) {
     if (!wrap) return;
     const rect = wrap.getBoundingClientRect();
     const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
     const d = drag.current;
     if (!d) {
-      if (props.editable !== false) setHoverT(markAt(x) === null ? Math.max(0, snap(xToTime(x), 14, e.altKey)) : null);
+      if (props.editable !== false) {
+        const overHandle = Math.abs(x - timeToX(markerSec)) <= 9 || markAt(x) !== null || y >= (props.height ?? 170) - CURSOR_STRIP;
+        setHoverT(overHandle ? null : Math.max(0, snap(xToTime(x), 14, e.altKey)));
+      }
+      return;
+    }
+    if (e.buttons === 0) {
+      endDrag(); // soltaste el botón sin que llegara el evento: dejar de arrastrar
       return;
     }
     const secPerPx = beatLenSec / zoom;
     if (d.mode === "pan") {
       const dBeats = (x - d.startX) / zoom;
-      props.onScrollChange?.(Math.max(-60, Math.min(totalBars * beatsPerBar + 60, d.startVal - dBeats)));
+      props.onScrollChange?.(clampScroll(d.startVal - dBeats));
     } else if (d.mode === "mark") {
       if (!d.moved && Math.abs(x - d.startX) < 4) return;
       d.moved = true;
       const t = Math.max(0, snap(xToTime(x), 10, e.altKey));
       props.onMoveMark?.(d.cur, t);
       d.cur = t;
-    } else if (d.mode === "auto") {
-      if (Math.abs(x - d.startX) < 4) return;
-      const t = Math.max(0, snap(xToTime(x), 10, e.altKey));
-      props.onAddMark?.(t);
-      drag.current = { mode: "mark", cur: t, moved: true, startX: x };
+    } else if (d.mode === "marker") {
+      props.onSetMarker?.(Math.max(0, snap(xToTime(x), 10, e.altKey)));
     } else {
       const t = Math.max(0, d.startVal + (x - d.startX) * secPerPx);
       props.onCursorChange?.(t);
     }
-  };
-
-  const onPointerUp = () => {
-    const d = drag.current;
-    // clic sobre una marca (sin arrastrar) = quitarla
-    if (d && d.mode === "mark" && !d.moved) props.onRemoveMark?.(d.cur);
-    drag.current = null;
   };
 
   const onContextMenu = (e: React.MouseEvent) => {
@@ -418,7 +462,9 @@ export function Waveform(props: Props) {
       style={{ height }}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
-      onPointerUp={onPointerUp}
+      onPointerUp={endDrag}
+      onPointerCancel={endDrag}
+      onLostPointerCapture={endDrag}
       onPointerLeave={() => setHoverT(null)}
       onContextMenu={onContextMenu}
     >
