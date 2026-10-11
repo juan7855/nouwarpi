@@ -270,6 +270,21 @@ export default function App() {
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
   }, [arrangeWindows]);
+  // si una ventana cambia de alto (otro modo, audio cargado, minimizar...) se recoloca todo para que no se pisen
+  useEffect(() => {
+    const main = mainRef.current;
+    if (!main || typeof ResizeObserver === "undefined") return;
+    let raf = 0;
+    const ro = new ResizeObserver(() => {
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(() => arrangeWindows());
+    });
+    main.querySelectorAll<HTMLElement>(":scope > [data-win]").forEach((w) => ro.observe(w));
+    return () => {
+      cancelAnimationFrame(raf);
+      ro.disconnect();
+    };
+  }, [arrangeWindows]);
 
   const stretchedRef = useRef<AudioBuffer | null>(null);
   const procToken = useRef(0);

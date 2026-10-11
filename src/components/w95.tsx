@@ -19,8 +19,9 @@ export function Win95Window(props: {
   const [pos, setPos] = useState(props.defaultPos ?? { x: 24, y: 24 });
   const [widthOv, setWidthOv] = useState<number | null>(null);
   const [minimized, setMinimized] = useState(false);
-  const [maximized, setMaximized] = useState(false);
+  const maximized = false; // las ventanas ya no se maximizan: tapaban a las demás
   const drag = useRef<{ dx: number; dy: number } | null>(null);
+  const moved = useRef(false);
 
   const isMobile = () => typeof window !== "undefined" && window.innerWidth < 820;
 
@@ -55,8 +56,6 @@ export function Win95Window(props: {
       if (!d) return;
       setPos({ x: d.x, y: d.y });
       setWidthOv(d.width ?? null);
-      setMaximized(false);
-      setMinimized(false);
     };
     window.addEventListener("w95-arrange", onArrange);
     return () => window.removeEventListener("w95-arrange", onArrange);
@@ -69,9 +68,9 @@ export function Win95Window(props: {
     const el = ref.current;
     if (!el) return;
     const r = el.getBoundingClientRect();
+    moved.current = false;
     drag.current = { dx: e.clientX - r.left, dy: e.clientY - r.top };
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-    window.dispatchEvent(new Event("w95-userdrag")); // el usuario coloca a mano: la app deja de reordenar sola
   };
   const onPointerMove = (e: React.PointerEvent) => {
     if (!drag.current) return;
@@ -82,6 +81,10 @@ export function Win95Window(props: {
     const el = ref.current;
     const parent = el?.offsetParent as HTMLElement | null;
     if (!el || !parent) return;
+    if (!moved.current) {
+      moved.current = true;
+      window.dispatchEvent(new Event("w95-userdrag")); // el usuario coloca a mano: la app deja de reordenar sola
+    }
     const pr = parent.getBoundingClientRect();
     // el puntero no puede salir de la zona visible (sobre la barra de estado)
     const cy = Math.max(0, Math.min(window.innerHeight - 60, e.clientY));
@@ -124,7 +127,7 @@ export function Win95Window(props: {
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
         onPointerCancel={onPointerUp}
-        onDoubleClick={() => floating && setMaximized((m) => !m)}
+        onDoubleClick={() => floating && setMinimized((m) => !m)}
       >
         <span className="w95-titlebar-text">{props.title}</span>
         <span className="w95-titlebar-btns">
@@ -135,17 +138,6 @@ export function Win95Window(props: {
             onClick={() => setMinimized((m) => !m)}
           >
             _
-          </button>
-          <button
-            className="w95-tb-btn"
-            tabIndex={-1}
-            aria-label="Maximizar"
-            onClick={() => {
-              setMaximized((m) => !m);
-              setMinimized(false);
-            }}
-          >
-            {maximized ? "❐" : "□"}
           </button>
           {props.onClose && (
             <button className="w95-tb-btn" tabIndex={-1} onClick={props.onClose} aria-label="Cerrar">✕</button>
