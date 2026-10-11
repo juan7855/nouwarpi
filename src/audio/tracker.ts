@@ -13,6 +13,7 @@ import { FFT, hannWindow } from "./dsp";
 
 export interface BeatTrack {
   beats: number[]; // segundos, cubren toda la canción (extrapolados donde no hay ataques)
+  beatGood: boolean[]; // por pulso: true si cae sobre un ataque real detectado (false = extrapolado)
   bpm: number; // tempo medio (ajuste de mínimos cuadrados)
   period: number; // segundos por pulso (ajuste)
   rmsMs: number; // desvío cuadrático medio de los pulsos respecto a la rejilla constante
@@ -35,6 +36,7 @@ export interface OnsetEvent {
 interface Onset {
   env: Float32Array; // fuerza de ataque normalizada
   low: Float32Array; // fuerza en graves (bombo/bajo)
+  body: Float32Array; // fuerza sin los agudos (bombo, caja, bajo, voces): los charleys no deciden el pulso
   hop: number;
   sr: number;
   N: number; // tamaño de FFT
@@ -82,28 +84,34 @@ function onsetStrength(x: Float32Array, sr: number): Onset {
   const c = 1000 / ref;
   const env = new Float32Array(frames);
   const low = new Float32Array(frames);
+  const body = new Float32Array(frames);
   const lowBands = 5; // ~30-170 Hz
+  const bodyBands = 16; // hasta ~3,5 kHz
   const prev = new Float32Array(nBands);
   for (let b = 0; b < nBands; b++) prev[b] = Math.log1p(c * mags[b]);
   for (let f = 1; f < frames; f++) {
     let fl = 0;
     let lw = 0;
+    let bw = 0;
     for (let b = 0; b < nBands; b++) {
       const v = Math.log1p(c * mags[f * nBands + b]);
       const d = v - prev[b];
       if (d > 0) {
         fl += d;
         if (b < lowBands) lw += d;
+        if (b < bodyBands) bw += d;
       }
       prev[b] = v;
     }
     env[f] = fl;
     low[f] = lw;
+    body[f] = bw;
   }
 
   normalizeEnv(env, Math.round(1 / (hop / sr)));
   normalizeEnv(low, Math.round(1 / (hop / sr)));
-  return { env, low, hop, sr, N };
+  normalizeEnv(body, Math.round(1 / (hop / sr)));
+  return { env, low, body, hop, sr, N };
 }
 
 // resta la media local (~1 s) y normaliza por la desviación: ataques comparables en toda la canción
@@ -127,49 +135,106 @@ function normalizeEnv(e: Float32Array, win: number) {
 
 /* ---------------- 2. tempo global ---------------- */
 
-function estimatePeriod(o: Onset): { periodFrames: number; confidence: number } {
+// Candidatos de periodo (en fotogramas): picos de la autocorrelación de TODA la canción, más sus
+// octavas (×2, ÷2) y relaciones 3:2. No se decide aquí: cada candidato se prueba con el seguidor
+// de pulsos y gana el que mejor cae sobre golpes fuertes (ver trackBeats).
+function periodCandidates(o: Onset): number[] {
   const { env, hop, sr } = o;
   const fps = sr / hop;
   const n = env.length;
   const minLag = Math.max(2, Math.floor((60 / 215) * fps));
   const maxLag = Math.min(n - 2, Math.ceil((60 / 55) * fps));
-  if (maxLag <= minLag) return { periodFrames: (60 / 120) * fps, confidence: 0 };
+  if (maxLag <= minLag) return [(60 / 120) * fps];
 
-  const ac = new Float64Array(maxLag + 2);
+  const ac = new Float64Array(maxLag * 2 + 4);
   let e0 = 0;
   for (let i = 0; i < n; i++) e0 += env[i] * env[i];
   e0 = e0 / n || 1;
-  for (let lag = minLag; lag <= maxLag + 1; lag++) {
+  const top = Math.min(ac.length - 1, maxLag * 2 + 2);
+  for (let lag = minLag; lag <= top; lag++) {
     let s = 0;
     for (let i = 0; i + lag < n; i++) s += env[i] * env[i + lag];
-    ac[lag] = s / (n - lag) / e0;
+    ac[lag] = n - lag > 0 ? s / (n - lag) / e0 : 0;
   }
-  // refuerzo armónico: un pulso real también repite a 2× y 4× su periodo
+  // refuerzo armónico (un pulso real también repite a 2× y 4× su periodo)
   const score = new Float64Array(maxLag + 1);
-  let best = minLag;
   for (let lag = minLag; lag <= maxLag; lag++) {
     let v = ac[lag];
-    if (2 * lag <= maxLag + 1) v += 0.5 * ac[2 * lag];
-    if (4 * lag <= maxLag + 1) v += 0.25 * ac[4 * lag];
-    const bpm = (60 * fps) / lag;
-    const prior = Math.exp(-0.5 * Math.pow(Math.log2(bpm / 118) / 0.9, 2)); // preferencia perceptual
-    score[lag] = v * (0.35 + 0.65 * prior);
-    if (score[lag] > score[best]) best = lag;
+    if (2 * lag < ac.length) v += 0.5 * ac[2 * lag];
+    if (4 * lag < ac.length) v += 0.25 * ac[4 * lag];
+    score[lag] = v;
   }
-  // interpolación parabólica
-  let lag = best;
-  if (best > minLag && best < maxLag) {
-    const y0 = score[best - 1];
-    const y1 = score[best];
-    const y2 = score[best + 1];
-    const d = y0 - 2 * y1 + y2;
-    if (Math.abs(d) > 1e-12) lag = best + (0.5 * (y0 - y2)) / d;
+  const peaks: { lag: number; v: number }[] = [];
+  for (let lag = minLag + 1; lag < maxLag; lag++) {
+    if (score[lag] > score[lag - 1] && score[lag] >= score[lag + 1]) {
+      const y0 = score[lag - 1];
+      const y1 = score[lag];
+      const y2 = score[lag + 1];
+      const d = y0 - 2 * y1 + y2;
+      peaks.push({ lag: Math.abs(d) > 1e-12 ? lag + (0.5 * (y0 - y2)) / d : lag, v: y1 });
+    }
   }
-  let mean = 0;
-  for (let l = minLag; l <= maxLag; l++) mean += score[l];
-  mean /= maxLag - minLag + 1;
-  const confidence = Math.max(0, Math.min(1, 1 - mean / Math.max(1e-9, score[best]) / 2));
-  return { periodFrames: lag, confidence };
+  peaks.sort((a, b) => b.v - a.v);
+  const out: number[] = [];
+  const push = (l: number) => {
+    if (l < minLag || l > maxLag) return;
+    if (out.some((x) => Math.abs(Math.log2(x / l)) < 0.03)) return;
+    out.push(l);
+  };
+  for (const pk of peaks.slice(0, 5)) {
+    push(pk.lag);
+    push(pk.lag * 2);
+    push(pk.lag / 2);
+    push(pk.lag * 1.5);
+    push(pk.lag / 1.5);
+  }
+  return out.length ? out : [(60 / 120) * fps];
+}
+
+// Preferencia suave por los tempos habituales (centrada hacia ~115 BPM, muy ancha: solo desempata).
+const tempoPrior = (bpm: number) => Math.exp(-0.5 * Math.pow(Math.log2(bpm / 115) / 1.2, 2));
+
+// Calidad de una cadena de pulsos: fuerza media del ataque en los pulsos, penalizando los que
+// caen en el vacío. Un tempo demasiado rápido deja pulsos vacíos; uno demasiado lento solo
+// aprovecha los golpes más fuertes (lo equilibra la preferencia por tempos habituales).
+function chainQuality(o: Onset, frames: number[], strongPeaks: number[]): number {
+  if (frames.length < 4) return 0;
+  let s = 0;
+  let hit = 0;
+  for (const f of frames) {
+    let m = 0;
+    for (let d = -2; d <= 2; d++) {
+      const j = f + d;
+      if (j >= 0 && j < o.env.length && o.env[j] > m) m = o.env[j];
+    }
+    s += m;
+    if (m > 0.5) hit++;
+  }
+  // rejilla de pulsos y medios pulsos de la cadena: los golpes fuertes deben caer en ella.
+  // Castiga a la vez el tempo equivocado y la fase equivocada (p. ej. enganchar la síncopa).
+  const lat: number[] = [];
+  for (let i = 0; i < frames.length; i++) {
+    lat.push(frames[i]);
+    if (i + 1 < frames.length) lat.push((frames[i] + frames[i + 1]) / 2);
+  }
+  let on = 0;
+  let total = 0;
+  const tol = 3;
+  for (const pk of strongPeaks) {
+    if (pk < lat[0] - tol || pk > lat[lat.length - 1] + tol) continue;
+    total++;
+    let lo = 0;
+    let hi = lat.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (lat[mid] < pk) lo = mid + 1;
+      else hi = mid;
+    }
+    const d = Math.min(Math.abs(lat[lo] - pk), lo > 0 ? Math.abs(lat[lo - 1] - pk) : 1e9);
+    if (d <= tol) on++;
+  }
+  const lattice = total ? on / total : 0.5;
+  return (s / frames.length) * (0.4 + 0.6 * (hit / frames.length)) * (0.4 + 0.6 * lattice);
 }
 
 /* ---------------- 3. programación dinámica ---------------- */
@@ -408,11 +473,41 @@ export function trackBeats(
 ): BeatTrack {
   const dur = x.length / sr;
   onProgress(0.05);
-  const o = onsetStrength(x, sr);
+  const o0 = onsetStrength(x, sr);
+  // el tempo y los pulsos se deciden sobre todo con el CUERPO de la música; los charleys en
+  // corcheas hacen que el pulso 'rápido' parezca el real (error de octava) y atraen al contratiempo
+  const mixed = new Float32Array(o0.env.length);
+  for (let i = 0; i < mixed.length; i++) mixed[i] = 0.75 * o0.body[i] + 0.25 * o0.env[i];
+  const o: Onset = { ...o0, env: mixed };
   onProgress(0.5);
-  const { periodFrames, confidence } = estimatePeriod(o);
+  // cada tempo candidato se prueba con el seguidor de pulsos; gana el que mejor cae sobre golpes
+  const strongPeaks: number[] = [];
+  {
+    let mx = 0;
+    for (const v of o.env) if (v > mx) mx = v;
+    for (let i = 2; i < o.env.length - 2; i++) {
+      const v = o.env[i];
+      if (v > 0.35 * mx && v >= o.env[i - 1] && v > o.env[i + 1] && v >= o.env[i - 2] && v > o.env[i + 2]) strongPeaks.push(i);
+    }
+  }
+  let periodFrames = 0;
+  let frames: number[] = [];
+  let bestScore = -1;
+  let secondScore = -1;
+  for (const cand of periodCandidates(o)) {
+    const fr = dpBeats(o, cand);
+    const bpmC = (60 * o.sr) / (cand * o.hop);
+    const sc = chainQuality(o, fr, strongPeaks) * tempoPrior(bpmC);
+    if (sc > bestScore) {
+      secondScore = bestScore;
+      bestScore = sc;
+      periodFrames = cand;
+      frames = fr;
+    } else if (sc > secondScore) secondScore = sc;
+  }
+  const confidence = bestScore > 0 ? Math.max(0, Math.min(1, 1 - Math.max(0, secondScore) / bestScore)) : 0;
   const period0 = (periodFrames * o.hop) / sr;
-  const frames = dpBeats(o, periodFrames);
+
   onProgress(0.8);
   const fine = fineFlux(x, sr);
   const onsets = validateOnsets(x, sr, onsetEvents(fine));
@@ -424,7 +519,22 @@ export function trackBeats(
   // un ataque cuenta solo si es significativo frente al resto de pulsos (descarta el ruido de intros/colas)
   const peaks = refined.filter((r) => r).map((r) => (r as { peak: number }).peak).sort((a, b) => a - b);
   const peakMed = peaks.length ? peaks[Math.floor(peaks.length / 2)] : 0;
-  const fineT: (number | null)[] = refined.map((r) => (r && r.peak >= 0.25 * peakMed ? r.t : null));
+  // y debe haber una subida real de energía (la escala logarítmica magnifica el rizado de un colchón
+  // de acordes en una intro y lo haría pasar por ataque)
+  const rmsWin = (a: number, b: number) => {
+    const i0 = Math.max(0, Math.floor(a * sr));
+    const i1 = Math.min(x.length, Math.floor(b * sr));
+    if (i1 <= i0) return 0;
+    let sum = 0;
+    for (let i = i0; i < i1; i++) sum += x[i] * x[i];
+    return Math.sqrt(sum / (i1 - i0));
+  };
+  const risesEnergy = (t: number) => {
+    const after = rmsWin(t, t + 0.03);
+    const before = rmsWin(t - 0.045, t - 0.005);
+    return after >= 1.15 * before || before < 1e-4;
+  };
+  const fineT: (number | null)[] = refined.map((r) => (r && r.peak >= 0.25 * peakMed && risesEnergy(r.t) ? r.t : null));
   const shifts: number[] = [];
   fineT.forEach((t, i) => t !== null && shifts.push(t - beats[i]));
   shifts.sort((a, b) => a - b);
@@ -437,6 +547,7 @@ export function trackBeats(
     const bpm = 60 / period0;
     return {
       beats: gridBeats(0, period0, dur),
+      beatGood: gridBeats(0, period0, dur).map(() => false),
       bpm,
       period: period0,
       rmsMs: 0,
@@ -534,6 +645,7 @@ export function trackBeats(
     const bpm = 60 / T0;
     return {
       beats: gridBeats(0, T0, dur),
+      beatGood: gridBeats(0, T0, dur).map(() => false),
       bpm,
       period: T0,
       rmsMs: 0,
@@ -610,7 +722,11 @@ export function trackBeats(
   while (timeAt(kStart - 1) >= 0) kStart--;
   let kEnd = gi[gi.length - 1];
   while (timeAt(kEnd + 1) < dur) kEnd++;
-  for (let k = kStart; k <= kEnd; k++) full.push(timeAt(k));
+  const fullGood: boolean[] = [];
+  for (let k = kStart; k <= kEnd; k++) {
+    full.push(timeAt(k));
+    fullGood.push(byInt.has(k));
+  }
 
   // tiempo fuerte: la fase del compás con más ataque grave
   const phaseScore = new Array(beatsPerBar).fill(0);
@@ -633,6 +749,7 @@ export function trackBeats(
   onProgress(1);
   return {
     beats: full,
+    beatGood: fullGood,
     bpm: 60 / T,
     period: T,
     rmsMs: rms * 1000,

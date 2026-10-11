@@ -21,6 +21,8 @@ interface Props {
   beatZero?: number; // índice en beatTimes del pulso 1 del compás de referencia
   marks?: number[]; // marcas puestas por el usuario (s, en el dominio de esta vista); la primera es el "1"
   snapTimes?: number[]; // ataques detectados (s, ordenados): las marcas se pegan a ellos
+  ticks?: number[]; // pulsos que el algoritmo detectó (s, dominio de esta vista): marcas cian en el borde superior
+  ticksGood?: boolean[]; // true = sobre un ataque real; false = extrapolado
   peaksOffset?: number; // segundos que la onda está desplazada en esta vista (relleno de silencio inicial)
   editable?: boolean; // true: clic = poner/quitar marcas. false: clic = mover el cursor
   onAddMark?: (t: number) => void;
@@ -203,6 +205,19 @@ export function Waveform(props: Props) {
       ctx.fillText("1", mx + 4, 24);
     }
 
+    // pulsos detectados por el algoritmo (cian = sobre un ataque real; gris = extrapolado)
+    if (props.ticks) {
+      const tk = props.ticks;
+      for (let i = 0; i < tk.length; i++) {
+        const t = tk[i];
+        if (t > tRight + 0.05) break;
+        if (t < tLeft - 0.05) continue;
+        const x = timeToX(t);
+        ctx.fillStyle = props.ticksGood?.[i] === false ? "#4a5a5a" : "#00e5ff";
+        ctx.fillRect(x - 1, H - 7, 3, 7);
+      }
+    }
+
     // marcas del usuario (la primera es el "1" rojo, ya dibujado)
     const userMarks = props.marks ?? [];
     userMarks.forEach((m, i) => {
@@ -251,7 +266,7 @@ export function Waveform(props: Props) {
     }
   }, [
     peaks, originSec, beatLenSec, beatsPerBar, markerSec, cursorSec,
-    zoom, scrollBar, height, xToTime, timeToX, tick, hoverT, props.marks, props.beatTimes, props.beatZero, props.peaksOffset,
+    zoom, scrollBar, height, xToTime, timeToX, tick, hoverT, props.marks, props.beatTimes, props.beatZero, props.peaksOffset, props.ticks, props.ticksGood,
   ]);
 
   // redibujar al redimensionar

@@ -224,6 +224,9 @@ function wsola(chs: Float32Array[], sr: number, map: WarpMap, onProgress: Progre
   const corrLen = Math.floor(Hs / D);
   const maxStart = pl - W - 1;
   let prevC = 0;
+  const coarse: number[] = []; // (candidato, puntuación) de la búsqueda gruesa
+  const cList = new Int32Array(K + 2); // fragmento elegido (índice con relleno)
+  const pinnedFlag = new Uint8Array(K + 2);
 
   // anclas de transitorio: cada pulso del plan (si lo hay) + los ataques detectados
   const beatPins = map.anchors.slice(1, -1).map((a) => Math.round(a.in)); // enteros: se usan como índice de muestra
@@ -268,11 +271,26 @@ function wsola(chs: Float32Array[], sr: number, map: WarpMap, onProgress: Progre
               aa += a * a;
             }
             const score = ab / Math.sqrt(aa);
+            coarse.push(cd, score);
             if (score > bestScore) {
               bestScore = score;
               bestD = cd;
             }
           }
+          // desempate hacia el lugar nominal: si varios alineamientos casi igual de buenos (material
+          // periódico), se toma el de menor desviación; así la desviación se mantiene pequeña y no hay
+          // un salto de fase cuando un fragmento posterior se ancla a un golpe
+          if (bestScore > 0) {
+            const thr = bestScore * 0.97;
+            let bestDev = Math.abs(bestD * D - nom);
+            for (let q = 0; q < coarse.length; q += 2) {
+              if (coarse[q + 1] >= thr && Math.abs(coarse[q] * D - nom) < bestDev) {
+                bestDev = Math.abs(coarse[q] * D - nom);
+                bestD = coarse[q];
+              }
+            }
+          }
+          coarse.length = 0;
         }
         // 2) refinado a resolución completa
         const c0 = bestD * D;
@@ -299,22 +317,43 @@ function wsola(chs: Float32Array[], sr: number, map: WarpMap, onProgress: Progre
         c = Math.min(maxStart, Math.max(0, nom));
       }
     }
-    // anclaje de transitorios: los fotogramas que contienen un ataque lo toman
-    // de su posición exacta, así el golpe cae en (posición × factor) sin deriva
-    while (oi < onsetOut.length && onsetOut[oi] < (k - 1) * Hs) oi++;
-    if (oi < onsetOut.length && onsetOut[oi] < (k + 1) * Hs) {
-      const pinned = onsetIn[oi] + pad - (onsetOut[oi] - (k - 1) * Hs);
-      if (pinned >= 0 && pinned <= maxStart) c = pinned;
+    // anclaje de transitorios: todo fragmento que PODRÍA llegar a incluir un ataque (su rango más el
+    // margen de búsqueda) lo toma de su posición exacta; si no, un vecino desplazado por la búsqueda
+    // lo copiaría en el borde de su ventana en un sitio equivocado (un "flam" audible).
+    // Con varias anclas posibles gana la más cercana al centro del fragmento.
+    const center = k * Hs;
+    while (oi < onsetOut.length && onsetOut[oi] < center - Hs - tol) oi++;
+    let pj = -1;
+    let pd = Infinity;
+    for (let j = oi; j < onsetOut.length && onsetOut[j] <= center + Hs + tol; j++) {
+      const d = Math.abs(onsetOut[j] - center);
+      if (d < pd) {
+        pd = d;
+        pj = j;
+      }
     }
+    if (pj >= 0) {
+      const pinned = onsetIn[pj] + pad - (onsetOut[pj] - (k - 1) * Hs);
+      if (pinned >= 0 && pinned <= maxStart) {
+        c = pinned;
+      }
+    }
+    cList[k] = c;
+    pinnedFlag[k] = pj >= 0 ? 1 : 0;
     prevC = c;
+    if ((k & 63) === 0) onProgress((0.5 * k) / K);
+  }
 
+  // ---- segunda pasada: mezcla con ventana de Hann (50 % de solape: suma exactamente 1)
+  for (let k = 0; k <= K; k++) {
     const o = k * Hs;
+    const c = cList[k];
     for (let ch = 0; ch < nCh; ch++) {
       const src = padded[ch];
       const dst = outBuf[ch];
       for (let i = 0; i < W; i++) dst[o + i] += src[c + i] * win[i];
     }
-    if ((k & 63) === 0) onProgress(k / K);
+    if ((k & 63) === 0) onProgress(0.5 + (0.5 * k) / K);
   }
 
   onProgress(1);

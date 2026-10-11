@@ -1,4 +1,4 @@
-import { trackBeats, fineFlux, refineOnset } from "../src/audio/tracker";
+import { trackBeats, fineFlux, onsetEvents } from "../src/audio/tracker";
 import { stretchChannels, StretchMethod } from "../src/audio/stretch";
 import { variablePlan, constantPlan } from "../src/audio/warp";
 import { makeSong } from "./song";
@@ -8,12 +8,14 @@ let fail = 0;
 const sr = 44100, target = 128, L = 60 / target;
 
 function gridErrors(out: Float32Array[], markerOut: number, nBeats: number) {
-  const fine = fineFlux(mono(out), sr);
+  const evs = onsetEvents(fineFlux(mono(out), sr));
   const errs: number[] = [];
   for (let k = 0; k < nBeats; k++) {
     const t = markerOut + k * L;
-    const r = refineOnset(fine, t, 0.04);
-    if (r) errs.push((r.t - t) * 1000);
+    // el golpe PRINCIPAL de la ventana (el ataque más fuerte), no el primero que supere un umbral
+    let best: { t: number; s: number } | null = null;
+    for (const e of evs) if (Math.abs(e.t - t) <= 0.05 && (!best || e.s > best.s)) best = e;
+    if (best) errs.push((best.t - t) * 1000);
   }
   return errs;
 }

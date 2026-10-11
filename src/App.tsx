@@ -15,6 +15,7 @@ import { Engine } from "./audio/engine";
 import type { BeatTrack } from "./audio/tracker";
 import { constantPlan, variablePlan, scaleBeats, anchorPlan, WarpPlan } from "./audio/warp";
 import { estefa } from "./audio/estefa";
+import { firstDownbeat, bestOctave, constantIsEnough } from "./audio/decide";
 import { Processor, CANCELLED } from "./audio/processor";
 import { decodeAudioFile } from "./audio/decode";
 import type { StretchMethod } from "./audio/stretch";
@@ -56,22 +57,6 @@ function mixToMono(buf: AudioBuffer): Float32Array {
   }
   if (buf.numberOfChannels > 1) for (let i = 0; i < n; i++) out[i] /= buf.numberOfChannels;
   return out;
-}
-
-// primer tiempo fuerte (inicio de compás) a partir del primer sonido real
-function firstDownbeat(tr: BeatTrack, bpb: number): number {
-  const beats = tr.beats;
-  if (!beats.length) return tr.firstSoundSec;
-  let i = beats.findIndex((b) => b >= tr.firstSoundSec - 0.08);
-  if (i < 0) i = 0;
-  // con todos los pulsos iguales (p. ej. un bombo en cada negra) no hay forma de saber cuál es el
-  // tiempo fuerte: se usa el primer golpe audible, que es lo que se espera
-  if (tr.downbeatMargin < 0.3) return beats[i];
-  for (let n = 0; n < bpb && i < beats.length - 1; n++) {
-    if ((((i - tr.downbeatPhase) % bpb) + bpb) % bpb === 0) break;
-    i++;
-  }
-  return beats[i];
 }
 
 const clampMarker = (t: number, max: number) => Math.max(0, Math.min(max, t));
@@ -161,7 +146,12 @@ export default function App() {
   const [tempoMode, setTempoMode] = useState<"const" | "var" | "estefa" | "manual">("const");
   const [estefaStrength, setEstefaStrength] = useState(1);
   const [estefaPick, setEstefaPick] = useState(0);
-  const [beatMult, setBeatMult] = useState<1 | 2 | 0.5>(1);
+  // octava: la lectura puede salir al doble o a la mitad del tempo "sentido". Por defecto se elige
+  // la que deja el tempo más cerca del BPM del proyecto (así se estira lo menos posible).
+  const [autoOctave, setAutoOctave] = useState(true);
+  const [octaveMult, setOctaveMult] = useState<1 | 2 | 0.5>(1);
+  const [bpmManual, setBpmManual] = useState(false);
+  const [playing, setPlaying] = useState<"orig" | "adj" | null>(null);
   const [analyzing, setAnalyzing] = useState(false);
   const [metronomeOn, setMetronomeOn] = useState(false);
   const [exportMode, setExportMode] = useState<"all" | "beat" | "sel">("all");
@@ -231,6 +221,15 @@ export default function App() {
   const barLen = beatLen * beatsPerBar;
   const origBeatLen = 60 / originalBPM;
   const origBarLen = origBeatLen * beatsPerBar;
+
+  const bestOct = useMemo<1 | 2 | 0.5>(() => (track ? bestOctave(track.bpm, projectBPM) : 1), [track, projectBPM]);
+  const beatMult: 1 | 2 | 0.5 = autoOctave ? bestOct : octaveMult;
+
+  // el BPM original sigue a la lectura (con la octava elegida) salvo que el usuario lo fije a mano
+  useEffect(() => {
+    if (!track || bpmManual) return;
+    setOriginalBPM(Math.min(300, Math.max(30, Math.round(track.bpm * beatMult * 100) / 100)));
+  }, [track, beatMult, bpmManual]);
 
   // pulsos detectados (con la subdivisión elegida) y plan de alineación
   const beatsAdj = useMemo(
@@ -362,7 +361,9 @@ export default function App() {
     setDetected(null);
     setTempoMode("const");
     setEstefaPick(0);
-    setBeatMult(1);
+    setAutoOctave(true);
+    setOctaveMult(1);
+    setBpmManual(false);
     setIrregular(false);
     setScrollBar(0);
     setTapCount(0);
@@ -385,13 +386,13 @@ export default function App() {
         setOriginalBPM(Math.round(tr.bpm * 100) / 100);
         setDetected({ firstBeat: marker, bpm: tr.bpm, conf: tr.confidence });
         const noPulse = tr.goodBeats < 8;
-        setTempoMode(noPulse ? "estefa" : tr.constantOk ? "const" : "var");
-        setIrregular(!tr.constantOk);
+        setTempoMode(noPulse ? "estefa" : constantIsEnough(tr) ? "const" : "var");
+        setIrregular(!constantIsEnough(tr));
         setAnalyzing(false);
         setStatus(
           noPulse
             ? "Sin pulso claro: Estefa decide el encaje"
-            : tr.constantOk
+            : constantIsEnough(tr)
               ? `Tempo estable: ${tr.bpm.toFixed(2)} BPM`
               : `Tempo variable (deriva ${tr.driftMs.toFixed(0)} ms): se sigue cada pulso`
         );
@@ -484,6 +485,7 @@ export default function App() {
     engineRef.current!.stop();
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
     rafRef.current = 0;
+    setPlaying(null);
   }, []);
 
   const startPlayback = useCallback(
@@ -531,8 +533,11 @@ export default function App() {
         onEnded: () => {
           if (rafRef.current) cancelAnimationFrame(rafRef.current);
           rafRef.current = 0;
+          setPlaying(null);
         },
       });
+      setPlaying(mode);
+      setSourceMode(mode);
 
       if (metronomeOn) {
         eng.startMetronome({
@@ -557,35 +562,52 @@ export default function App() {
       };
       rafRef.current = requestAnimationFrame(tick);
       setStatus(
-        mode === "adj" ? "Reproduciendo: ajustado" : "Reproduciendo: original"
+        mode === "adj" ? "▶ SONANDO: SINCRONIZADA (al tempo del proyecto)" : "▶ SONANDO: ORIGINAL (sin ajustar)"
       );
     },
     [file, plan, pad, loopOn, loopBars, barLen, metronomeOn, projectBPM, beatsPerBar]
   );
 
-  const onCompare = useCallback(() => {
-    if (!file) return;
-    const n = sourceMode === "adj" ? "orig" : "adj";
-    setSourceMode(n);
-    startPlayback(n, plan.fwd(cursorSec) + pad);
-  }, [file, sourceMode, startPlayback, cursorSec, plan, pad]);
+  // Reproduce una fuente. Si ya está sonando la otra, CAMBIA en la misma posición musical (A/B).
+  const playSource = useCallback(
+    (mode: "adj" | "orig") => {
+      if (!file) return;
+      const from = playing || cursorSec > 0.001 ? plan.fwd(cursorSec) + pad : markerOut;
+      startPlayback(mode, from);
+    },
+    [file, playing, cursorSec, plan, pad, markerOut, startPlayback]
+  );
+
+  // al activar/desactivar el metrónomo con el audio sonando, se reinicia en la misma posición
+  const prevMetro = useRef(metronomeOn);
+  useEffect(() => {
+    if (prevMetro.current === metronomeOn) return;
+    prevMetro.current = metronomeOn;
+    if (playing) startPlayback(playing, plan.fwd(cursorSec) + pad);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [metronomeOn]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (
-        e.code === "Space" &&
-        !(e.target instanceof HTMLInputElement) &&
-        !(e.target instanceof HTMLSelectElement) &&
-        !(e.target instanceof HTMLTextAreaElement)
-      ) {
+        e.target instanceof HTMLInputElement ||
+        e.target instanceof HTMLSelectElement ||
+        e.target instanceof HTMLTextAreaElement
+      )
+        return;
+      if (e.code === "Space") {
         e.preventDefault();
         if (engineRef.current!.playing) stopPlayback();
-        else startPlayback(sourceMode, plan.fwd(cursorSec) + pad);
+        else playSource(sourceMode);
+      } else if (e.key === "1" || e.key.toLowerCase() === "o") {
+        playSource("orig");
+      } else if (e.key === "2" || e.key.toLowerCase() === "s") {
+        playSource("adj");
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [startPlayback, stopPlayback, sourceMode, cursorSec, plan, pad]);
+  }, [playSource, stopPlayback, sourceMode]);
 
   /* ---------- detección / tap ---------- */
 
@@ -594,8 +616,8 @@ export default function App() {
       setStatus(analyzing ? "Aún analizando…" : "No hay lectura de pulsos disponible.");
       return;
     }
-    setOriginalBPM(Math.round(track.bpm * 100) / 100);
-    setBeatMult(1);
+    setAutoOctave(true);
+    setBpmManual(false);
     setIrregular(!track.constantOk);
     setStatus(
       track.constantOk
@@ -613,6 +635,25 @@ export default function App() {
   }, [file, track, beatsPerBar]);
 
   /* ---------- marcas con clics ---------- */
+
+  // correr el "1" un pulso (corregir el tiempo fuerte): al pulso detectado anterior / siguiente
+  const shiftMarkerBeat = useCallback(
+    (dir: -1 | 1) => {
+      if (!file) return;
+      const beats = track && track.beats.length ? track.beats : null;
+      const cur = markerSec;
+      let next: number;
+      if (beats) {
+        const good = beats.filter((_, i) => track!.beatGood[i] !== false);
+        const list = good.length > 4 ? good : beats;
+        const cand = dir > 0 ? list.find((b) => b > cur + 0.02) : [...list].reverse().find((b) => b < cur - 0.02);
+        next = cand ?? cur + dir * origBeatLen;
+      } else next = cur + dir * origBeatLen;
+      setMarkerSec(clampMarker(next, file.duration));
+    },
+    [file, track, markerSec, origBeatLen, setMarkerSec]
+  );
+
 
   const snapTimes = useMemo(() => (track ? track.onsets.map((o) => o.t) : undefined), [track]);
 
@@ -661,7 +702,10 @@ export default function App() {
     for (let i = 1; i < marks.length; i++) d.push(marks[i] - marks[i - 1]);
     d.sort((a, b) => a - b);
     const med = d[Math.floor(d.length / 2)];
-    if (med > 0.05) setOriginalBPM(Math.min(300, Math.max(30, Math.round((60 / med) * 100) / 100)));
+    if (med > 0.05) {
+      setBpmManual(true);
+      setOriginalBPM(Math.min(300, Math.max(30, Math.round((60 / med) * 100) / 100)));
+    }
   }, [marks]);
 
   // "Ver toda la canción"
@@ -689,9 +733,16 @@ export default function App() {
   }, [track, analyzing, tempoMode]);
 
   const bumpTempo = useCallback((k: 2 | 0.5) => {
-    setBeatMult((m) => (m * k === 2 ? 2 : m * k === 0.5 ? 0.5 : m * k === 1 ? 1 : m));
-    setOriginalBPM((v) => Math.min(300, Math.max(30, Math.round(v * k * 100) / 100)));
-  }, []);
+    if (track) {
+      const nm = beatMult * k;
+      setAutoOctave(false);
+      setBpmManual(false);
+      setOctaveMult(nm >= 2 ? 2 : nm <= 0.5 ? 0.5 : 1);
+    } else {
+      setBpmManual(true);
+      setOriginalBPM((v) => Math.min(300, Math.max(30, Math.round(v * k * 100) / 100)));
+    }
+  }, [track, beatMult]);
 
   const onTap = useCallback(() => {
     const now = performance.now();
@@ -704,6 +755,7 @@ export default function App() {
       for (let i = 1; i < ts.length; i++) sum += ts[i] - ts[i - 1];
       const avg = sum / (ts.length - 1);
       const bpm = Math.round((60000 / avg) * 10) / 10;
+      setBpmManual(true);
       setOriginalBPM(bpm);
       setStatus("BPM por Tap: " + bpm.toFixed(1));
     }
@@ -955,6 +1007,12 @@ export default function App() {
             {/* ajuste fino del marcador */}
             <div className="flex items-center gap-1 flex-wrap">
               <span className="w95-label mr-1">Marcador:</span>
+              <W95Button onClick={() => shiftMarkerBeat(-1)} disabled={!file} title="Mover el 1 al pulso anterior">
+                « pulso
+              </W95Button>
+              <W95Button onClick={() => shiftMarkerBeat(1)} disabled={!file} title="Mover el 1 al pulso siguiente">
+                pulso »
+              </W95Button>
               <W95Button
                 onClick={() => file && setMarkerSec((m) => clampMarker(m - 0.05, file.duration))}
                 disabled={!file}
@@ -998,7 +1056,10 @@ export default function App() {
 
             {/* onda original */}
             <div className="w95-group-title">
-              Original (rojo = primer golpe, naranja = marcas, amarillo = cursor)
+              <span style={playing === "orig" ? { background: "#ffa733", padding: "0 4px" } : undefined}>
+                ORIGINAL{playing === "orig" ? " ● sonando" : ""}
+              </span>{" "}
+              (rojo = el 1, naranja = marcas, cian = pulsos detectados, amarillo = cursor)
             </div>
             <Waveform
               peaks={peaksOrig}
@@ -1010,6 +1071,8 @@ export default function App() {
               totalBars={origBars}
               markerSec={markerSec}
               marks={marks}
+              ticks={track ? track.beats : undefined}
+              ticksGood={track ? track.beatGood : undefined}
               snapTimes={snapTimes}
               editable
               onAddMark={addMark}
@@ -1026,7 +1089,10 @@ export default function App() {
 
             {/* onda ajustada */}
             <div className="w95-group-title">
-              Ajustado al tempo del proyecto (alineado por el marcador)
+              <span style={playing === "adj" ? { background: "#33dd55", padding: "0 4px" } : undefined}>
+                SINCRONIZADA{playing === "adj" ? " ● sonando" : ""}
+              </span>{" "}
+              (al tempo del proyecto, alineada por el marcador)
             </div>
             <Waveform
               peaks={peaksAdj}
@@ -1037,6 +1103,8 @@ export default function App() {
               markerSec={markerOut}
               peaksOffset={pad}
               marks={marks.map((m) => plan.fwd(m) + pad)}
+              ticks={track ? track.beats.map((b) => plan.fwd(b) + pad) : undefined}
+              ticksGood={track ? track.beatGood : undefined}
               editable={false}
               cursorSec={plan.fwd(cursorSec) + pad}
               onCursorChange={(t) =>
@@ -1107,7 +1175,10 @@ export default function App() {
                 </span>
                 <W95NumField
                   value={originalBPM}
-                  onChange={setOriginalBPM}
+                  onChange={(v) => {
+                    setBpmManual(true);
+                    setOriginalBPM(v);
+                  }}
                   min={30}
                   max={300}
                   disabled={tempoMode !== "const"}
@@ -1135,6 +1206,11 @@ export default function App() {
                   Tap ({tapCount})
                 </W95Button>
               </div>
+              {track && autoOctave && beatMult !== 1 && tempoMode !== "estefa" && (
+                <div className="w95-label" style={{ color: "#404040" }}>
+                  {`Lectura ${track.bpm.toFixed(1)} BPM → se usa ${beatMult === 2 ? "×2" : "÷2"} (la octava más cercana al proyecto).`}
+                </div>
+              )}
               <div className="flex items-center gap-2 mt-1">
                 <span className="w95-label" style={{ width: 105, flex: "0 0 auto" }}>
                   Modo de tempo:
@@ -1255,11 +1331,7 @@ export default function App() {
                 {method === "resample" &&
                   "No deforma la onda en absoluto, pero sube/baja el tono como un vinilo."}
               </div>
-              <W95Checkbox
-                checked={metronomeOn}
-                onChange={setMetronomeOn}
-                label="Metrónomo"
-              />
+
             </div>
 
             <div>
@@ -1322,27 +1394,76 @@ export default function App() {
           title="Reproducción"
           draggable
           defaultPos={{ x: 374, y: 664 }}
-          width={380}
+          width={400}
           zIndex={focus === "repro" ? 60 : 10}
           onFocus={() => setFocus("repro")}
         >
           <div className="flex flex-col gap-2">
+            {/* indicador grande: qué se está escuchando */}
+            <div
+              className="w95-sunken"
+              style={{
+                padding: "7px 8px",
+                fontWeight: "bold",
+                fontSize: 14,
+                textAlign: "center",
+                color: playing ? "#000000" : "#404040",
+                background: playing === "orig" ? "#ffa733" : playing === "adj" ? "#33dd55" : "#d8d8d8",
+              }}
+            >
+              {playing === "orig"
+                ? "● SONANDO: ORIGINAL (sin ajustar)"
+                : playing === "adj"
+                  ? "● SONANDO: SINCRONIZADA (al tempo del proyecto)"
+                  : "■ Detenido"}
+            </div>
+            <div className="flex gap-2">
+              <W95Button
+                onClick={() => playSource("orig")}
+                disabled={!file}
+                title="Teclas: 1 u O"
+                style={{
+                  flex: 1,
+                  fontWeight: "bold",
+                  minHeight: 34,
+                  ...(playing === "orig" ? { background: "#ffa733" } : {}),
+                }}
+              >
+                ▶ ORIGINAL
+              </W95Button>
+              <W95Button
+                onClick={() => playSource("adj")}
+                disabled={!file}
+                title="Teclas: 2 o S"
+                style={{
+                  flex: 1,
+                  fontWeight: "bold",
+                  minHeight: 34,
+                  ...(playing === "adj" ? { background: "#33dd55" } : {}),
+                }}
+              >
+                ▶ SINCRONIZADA
+              </W95Button>
+              <W95Button onClick={stopPlayback} disabled={!file || !playing} style={{ minHeight: 34 }}>
+                ■
+              </W95Button>
+            </div>
+            <div className="w95-label" style={{ color: "#404040" }}>
+              Mientras suena, pulsa el otro botón para cambiar en la misma posición (A/B). Teclas: Espacio =
+              reproducir/parar · 1 = original · 2 = sincronizada.
+            </div>
             <div className="flex gap-2 flex-wrap">
-              <W95Button
-                onClick={() => startPlayback(sourceMode, plan.fwd(cursorSec) + pad)}
-                disabled={!file}
-              >
-                ▶ Desde el cursor
+              <W95Button onClick={() => file && startPlayback(sourceMode, markerOut)} disabled={!file}>
+                ⏮ Desde el primer golpe
               </W95Button>
-              <W95Button
-                onClick={() => startPlayback(sourceMode, pad)}
-                disabled={!file}
-              >
-                ▶ Desde el primer golpe
-              </W95Button>
-              <W95Button onClick={stopPlayback} disabled={!file}>
-                ■ Detener
-              </W95Button>
+            </div>
+            <W95Checkbox
+              checked={metronomeOn}
+              onChange={setMetronomeOn}
+              label="Metrónomo al tempo del proyecto (clic en cada pulso)"
+            />
+            <div className="w95-label" style={{ color: "#404040" }}>
+              Con el metrónomo, el ORIGINAL se va descolocando de los clics; la SINCRONIZADA queda fija en ellos.
             </div>
             <div className="flex items-center gap-2 flex-wrap">
               <W95Checkbox
@@ -1359,12 +1480,6 @@ export default function App() {
               />
               <span className="w95-label">compases</span>
             </div>
-            <div className="flex items-center gap-2 flex-wrap">
-              <W95Button onClick={onCompare} disabled={!file}>
-                Comparar: {sourceMode === "adj" ? "Ajustado" : "Original"}
-              </W95Button>
-              <span className="w95-label">Metrónomo: {metronomeOn ? "sí" : "no"}</span>
-            </div>
             <div className="flex items-center gap-2">
               <span className="w95-label">Posición:</span>
               <W95Field>
@@ -1372,8 +1487,7 @@ export default function App() {
               </W95Field>
             </div>
             <div className="w95-label" style={{ color: "#404040" }}>
-              Volumen igual al original (sin normalizar, sin comprimir). Se oye en
-              tiempo real al mover el marcador o cambiar el tempo.
+              Volumen igual al original (sin normalizar, sin comprimir).
             </div>
           </div>
         </Win95Window>
@@ -1469,6 +1583,8 @@ export default function App() {
                 ajústalo al tempo de tu proyecto y descárgalo sincronizado.
               </div>
               <div className="w95-label">· Lee los pulsos de toda la canción; si el tempo se mueve, alinea cada pulso a la rejilla</div>
+              <div className="w95-label">· Comparador A/B: ORIGINAL / SINCRONIZADA con indicador y cambio en caliente (teclas 1 y 2)</div>
+              <div className="w95-label">· El tempo se lee con el cuerpo de la música (no los charleys) y se elige la octava más cercana al proyecto</div>
               <div className="w95-label">· Marcas con clics: se pegan al golpe, se quitan con otro clic; con 2 o más, tus marcas son los pulsos</div>
               <div className="w95-label">· Estefa: sin BPM de origen, decide el tempo natural y cuantiza elásticamente cada sonido</div>
               <div className="w95-label">· Estirado en un Web Worker: tres algoritmos, golpes anclados al compás</div>
