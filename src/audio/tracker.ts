@@ -20,6 +20,7 @@ export interface BeatTrack {
   constantOk: boolean; // true si un tempo constante basta
   confidence: number; // 0..1
   downbeatPhase: number; // 0..beatsPerBar-1: índice de pulso (módulo) que más pesa
+  downbeatMargin: number; // 0..1: cuánto destaca esa fase (poco = ambiguo: todos los pulsos suenan igual)
   firstSoundSec: number; // primer instante con sonido real
   contentEnd: number; // último instante con sonido real (s)
   goodBeats: number; // pulsos con ataque real y coherente (pocos = sin pulso claro)
@@ -443,6 +444,7 @@ export function trackBeats(
       constantOk: true,
       confidence: 0,
       downbeatPhase: 0,
+      downbeatMargin: 0,
       firstSoundSec: firstSound(x, sr),
       contentEnd,
       goodBeats: 0,
@@ -539,6 +541,7 @@ export function trackBeats(
       constantOk: true,
       confidence: 0,
       downbeatPhase: 0,
+      downbeatMargin: 0,
       firstSoundSec: firstSound(x, sr),
       contentEnd,
       goodBeats: 0,
@@ -624,6 +627,8 @@ export function trackBeats(
   for (let p = 1; p < beatsPerBar; p++) if (phaseScore[p] > phaseScore[phase]) phase = p;
   // el índice de fase se expresa respecto al primer elemento de `full`
   const downbeatPhase = (((phase - kStart) % beatsPerBar) + beatsPerBar) % beatsPerBar;
+  const sortedPh = phaseScore.slice().sort((a, b) => b - a);
+  const downbeatMargin = sortedPh[0] > 0 ? (sortedPh[0] - sortedPh[1]) / sortedPh[0] : 0;
 
   onProgress(1);
   return {
@@ -635,6 +640,7 @@ export function trackBeats(
     constantOk: drift < 0.02 && rms < 0.015,
     confidence,
     downbeatPhase,
+    downbeatMargin,
     firstSoundSec: firstSound(x, sr),
     contentEnd,
     goodBeats: gi.length,

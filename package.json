@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test:dsp": "esbuild tests/dsp.test.ts tests/tracker.test.ts tests/warp.test.ts tests/estefa.test.ts --bundle --platform=node --format=esm --outdir=.tmp --log-level=error && node .tmp/dsp.test.js && node .tmp/tracker.test.js && node .tmp/warp.test.js && node .tmp/estefa.test.js"
+    "test:dsp": "esbuild tests/dsp.test.ts tests/tracker.test.ts tests/warp.test.ts tests/estefa.test.ts tests/manual.test.ts --bundle --platform=node --format=esm --outdir=.tmp --log-level=error && node .tmp/dsp.test.js && node .tmp/tracker.test.js && node .tmp/warp.test.js && node .tmp/estefa.test.js && node .tmp/manual.test.js"
   },
   "dependencies": {
     "clsx": "2.1.1",

@@ -19,6 +19,13 @@ interface Props {
   totalBars: number; // compases totales (para limitar desplazamiento)
   beatTimes?: number[]; // pulsos reales (s) en el dominio de esta vista; sustituyen a la rejilla uniforme
   beatZero?: number; // índice en beatTimes del pulso 1 del compás de referencia
+  marks?: number[]; // marcas puestas por el usuario (s, en el dominio de esta vista); la primera es el "1"
+  snapTimes?: number[]; // ataques detectados (s, ordenados): las marcas se pegan a ellos
+  peaksOffset?: number; // segundos que la onda está desplazada en esta vista (relleno de silencio inicial)
+  editable?: boolean; // true: clic = poner/quitar marcas. false: clic = mover el cursor
+  onAddMark?: (t: number) => void;
+  onRemoveMark?: (t: number) => void;
+  onMoveMark?: (from: number, to: number) => void;
   markerSec: number;
   onMarkerChange?: (t: number) => void;
   cursorSec: number;
@@ -30,6 +37,10 @@ interface Props {
   height?: number;
 }
 
+export const ZOOM_MIN = 2; // px por pulso (vista de toda la canción)
+export const ZOOM_MAX = 20000; // px por pulso (precisión de muestra)
+
+const MARK = "#ff8000";
 const GREEN = "#00ff00";
 const GREEN_DIM = "#005a00";
 const GRID_BEAT = "#242424";
@@ -42,10 +53,13 @@ export function Waveform(props: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const drag = useRef<
-    | { mode: "marker" | "cursor" | "pan"; startX: number; startVal: number }
+    | { mode: "mark"; cur: number; moved: boolean; startX: number }
+    | { mode: "auto"; startX: number }
+    | { mode: "cursor" | "pan"; startX: number; startVal: number }
     | null
   >(null);
   const [tick, setTick] = useState(0);
+  const [hoverT, setHoverT] = useState<number | null>(null);
   const {
     peaks,
     originSec,
@@ -134,7 +148,7 @@ export function Waveform(props: Props) {
       const nBuckets = min.length;
       const sr = sampleRate;
       for (let x = 0; x < W; x++) {
-        const t0 = xToTime(x);
+        const t0 = xToTime(x) - (props.peaksOffset ?? 0);
         const t1 = t0 + secPerPx;
         let b0 = Math.floor(t0 * sr) / bucket;
         let b1 = Math.ceil(t1 * sr) / bucket;
@@ -153,7 +167,7 @@ export function Waveform(props: Props) {
         if (mx < mn) continue;
         const yTop = mid - mx * (mid - 2);
         const yBot = mid - mn * (mid - 2);
-        const afterMarker = t0 + secPerPx / 2 >= markerSec - 1e-9;
+        const afterMarker = t0 + (props.peaksOffset ?? 0) + secPerPx / 2 >= markerSec - 1e-9;
         ctx.strokeStyle = afterMarker ? GREEN : GREEN_DIM;
         ctx.lineWidth = 1;
         ctx.beginPath();
@@ -189,6 +203,38 @@ export function Waveform(props: Props) {
       ctx.fillText("1", mx + 4, 24);
     }
 
+    // marcas del usuario (la primera es el "1" rojo, ya dibujado)
+    const userMarks = props.marks ?? [];
+    userMarks.forEach((m, i) => {
+      if (i === 0) return;
+      const x = timeToX(m);
+      if (x < -8 || x > W + 8) return;
+      ctx.strokeStyle = MARK;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, H);
+      ctx.stroke();
+      ctx.fillStyle = MARK;
+      ctx.fillRect(x - 5, 1, 10, 9);
+      ctx.fillStyle = "#ffb060";
+      ctx.font = "bold 10px 'Courier New', monospace";
+      ctx.fillText(String(i + 1), x + 4, 22);
+    });
+
+    // vista previa: dónde caería la marca si haces clic (imán a los ataques)
+    if (hoverT !== null && props.editable !== false) {
+      const hx = timeToX(hoverT);
+      ctx.strokeStyle = "#ffffff";
+      ctx.lineWidth = 1;
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath();
+      ctx.moveTo(hx + 0.5, 0);
+      ctx.lineTo(hx + 0.5, H);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
     // cursor de reproducción (amarillo)
     const cx = timeToX(cursorSec);
     if (cx >= -2 && cx <= W + 2) {
@@ -205,7 +251,7 @@ export function Waveform(props: Props) {
     }
   }, [
     peaks, originSec, beatLenSec, beatsPerBar, markerSec, cursorSec,
-    zoom, scrollBar, height, xToTime, timeToX, tick,
+    zoom, scrollBar, height, xToTime, timeToX, tick, hoverT, props.marks, props.beatTimes, props.beatZero, props.peaksOffset,
   ]);
 
   // redibujar al redimensionar
@@ -215,29 +261,62 @@ export function Waveform(props: Props) {
     return () => window.removeEventListener("resize", onResize);
   }, []);
 
-  // rueda del ratón → zoom
+  // rueda del ratón → zoom proporcional alrededor del puntero (Mayús + rueda = desplazar)
   useEffect(() => {
     const wrap = wrapRef.current;
     if (!wrap) return;
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
+      const dy = e.deltaY * (e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 400 : 1);
       const rect = wrap.getBoundingClientRect();
       const mx = e.clientX - rect.left;
+      if (e.shiftKey) {
+        props.onScrollChange?.(Math.max(-60, Math.min(totalBars * beatsPerBar + 60, scrollBar + dy / zoom)));
+        return;
+      }
       const tAnchor = xToTime(mx);
-      const f = e.deltaY < 0 ? 1.25 : 0.8;
-      const newZoom = Math.max(24, Math.min(2400, zoom * f));
+      const newZoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, zoom * Math.exp(-dy * 0.0022)));
+      if (newZoom === zoom) return;
       props.onZoomChange?.(newZoom);
-      const newScroll =
-        1 + (tAnchor - originSec) / beatLenSec - mx / newZoom;
-      props.onScrollChange?.(Math.max(-60, Math.min(totalBars + 60, newScroll)));
+      const newScroll = 1 + (tAnchor - originSec) / beatLenSec - mx / newZoom;
+      props.onScrollChange?.(Math.max(-60, Math.min(totalBars * beatsPerBar + 60, newScroll)));
     };
     wrap.addEventListener("wheel", onWheel, { passive: false });
     return () => wrap.removeEventListener("wheel", onWheel);
-  }, [xToTime, zoom, originSec, beatLenSec, totalBars, props]);
+  }, [xToTime, zoom, scrollBar, originSec, beatLenSec, beatsPerBar, totalBars, props]);
+
+  // imán: el ataque detectado más cercano (dentro de `px` píxeles)
+  const snap = (t: number, px: number, off: boolean) => {
+    const st = props.snapTimes;
+    if (off || !st || !st.length) return t;
+    const radius = (px * beatLenSec) / zoom;
+    let lo = 0;
+    let hi = st.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (st[mid] < t) lo = mid + 1;
+      else hi = mid;
+    }
+    let best = t;
+    let bd = radius;
+    for (const i of [lo - 1, lo]) {
+      if (i >= 0 && i < st.length && Math.abs(st[i] - t) <= bd) {
+        bd = Math.abs(st[i] - t);
+        best = st[i];
+      }
+    }
+    return best;
+  };
+
+  const markAt = (x: number): number | null => {
+    for (const m of props.marks ?? []) if (Math.abs(timeToX(m) - x) <= 7) return m;
+    return null;
+  };
 
   const onPointerDown = (e: React.PointerEvent) => {
     const wrap = wrapRef.current;
     if (!wrap) return;
+    if (e.button === 2) return; // clic derecho: se gestiona en onContextMenu
     const rect = wrap.getBoundingClientRect();
     const x = e.clientX - rect.left;
     (e.target as HTMLElement).setPointerCapture(e.pointerId);
@@ -245,36 +324,56 @@ export function Waveform(props: Props) {
       drag.current = { mode: "pan", startX: x, startVal: scrollBar };
       return;
     }
-    const mX = timeToX(markerSec);
+    const editable = props.editable !== false;
     const cX = timeToX(cursorSec);
-    if (Math.abs(x - mX) < 10) {
-      drag.current = { mode: "marker", startX: x, startVal: markerSec };
-    } else if (Math.abs(x - cX) < 10) {
-      drag.current = { mode: "cursor", startX: x, startVal: cursorSec };
-    } else {
-      // clic: colocar el marcador y arrastrar
-      const t = Math.max(0, xToTime(x));
-      props.onMarkerChange?.(t);
-      drag.current = { mode: "marker", startX: x, startVal: t };
+    if (editable) {
+      const m = markAt(x);
+      if (m !== null) {
+        drag.current = { mode: "mark", cur: m, moved: false, startX: x };
+        return;
+      }
+      if (!(props.marks && props.marks.length) && Math.abs(x - timeToX(markerSec)) <= 7) {
+        drag.current = { mode: "auto", startX: x }; // el marcador automático: al moverlo pasa a ser una marca
+        return;
+      }
+      if (Math.abs(x - cX) < 8) {
+        drag.current = { mode: "cursor", startX: x, startVal: cursorSec };
+        return;
+      }
+      // clic en vacío: poner una marca (pegada al ataque más cercano; Alt = sin imán)
+      props.onAddMark?.(Math.max(0, snap(xToTime(x), 14, e.altKey)));
+      return;
     }
+    // vista ajustada: clic = colocar el cursor de reproducción
+    props.onCursorChange?.(Math.max(0, xToTime(x)));
+    drag.current = { mode: "cursor", startX: x, startVal: Math.max(0, xToTime(x)) };
   };
 
   const onPointerMove = (e: React.PointerEvent) => {
-    const d = drag.current;
-    if (!d) return;
     const wrap = wrapRef.current;
     if (!wrap) return;
     const rect = wrap.getBoundingClientRect();
     const x = e.clientX - rect.left;
+    const d = drag.current;
+    if (!d) {
+      if (props.editable !== false) setHoverT(markAt(x) === null ? Math.max(0, snap(xToTime(x), 14, e.altKey)) : null);
+      return;
+    }
     const secPerPx = beatLenSec / zoom;
     if (d.mode === "pan") {
-      const dBars = (x - d.startX) / zoom;
-      props.onScrollChange?.(
-        Math.max(-60, Math.min(totalBars + 60, d.startVal - dBars))
-      );
-    } else if (d.mode === "marker") {
-      const t = Math.max(0, d.startVal + (x - d.startX) * secPerPx);
-      props.onMarkerChange?.(t);
+      const dBeats = (x - d.startX) / zoom;
+      props.onScrollChange?.(Math.max(-60, Math.min(totalBars * beatsPerBar + 60, d.startVal - dBeats)));
+    } else if (d.mode === "mark") {
+      if (!d.moved && Math.abs(x - d.startX) < 4) return;
+      d.moved = true;
+      const t = Math.max(0, snap(xToTime(x), 10, e.altKey));
+      props.onMoveMark?.(d.cur, t);
+      d.cur = t;
+    } else if (d.mode === "auto") {
+      if (Math.abs(x - d.startX) < 4) return;
+      const t = Math.max(0, snap(xToTime(x), 10, e.altKey));
+      props.onAddMark?.(t);
+      drag.current = { mode: "mark", cur: t, moved: true, startX: x };
     } else {
       const t = Math.max(0, d.startVal + (x - d.startX) * secPerPx);
       props.onCursorChange?.(t);
@@ -282,7 +381,19 @@ export function Waveform(props: Props) {
   };
 
   const onPointerUp = () => {
+    const d = drag.current;
+    // clic sobre una marca (sin arrastrar) = quitarla
+    if (d && d.mode === "mark" && !d.moved) props.onRemoveMark?.(d.cur);
     drag.current = null;
+  };
+
+  const onContextMenu = (e: React.MouseEvent) => {
+    e.preventDefault();
+    const wrap = wrapRef.current;
+    if (!wrap || props.editable === false) return;
+    const x = e.clientX - wrap.getBoundingClientRect().left;
+    const m = markAt(x);
+    if (m !== null) props.onRemoveMark?.(m);
   };
 
   return (
@@ -293,6 +404,8 @@ export function Waveform(props: Props) {
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
+      onPointerLeave={() => setHoverT(null)}
+      onContextMenu={onContextMenu}
     >
       <canvas ref={canvasRef} />
     </div>

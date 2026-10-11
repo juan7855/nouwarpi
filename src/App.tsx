@@ -10,7 +10,7 @@ import {
   W95Field,
   HScrollbar,
 } from "./components/w95";
-import { Waveform, Peaks } from "./components/Waveform";
+import { Waveform, Peaks, ZOOM_MIN, ZOOM_MAX } from "./components/Waveform";
 import { Engine } from "./audio/engine";
 import type { BeatTrack } from "./audio/tracker";
 import { constantPlan, variablePlan, scaleBeats, anchorPlan, WarpPlan } from "./audio/warp";
@@ -64,6 +64,9 @@ function firstDownbeat(tr: BeatTrack, bpb: number): number {
   if (!beats.length) return tr.firstSoundSec;
   let i = beats.findIndex((b) => b >= tr.firstSoundSec - 0.08);
   if (i < 0) i = 0;
+  // con todos los pulsos iguales (p. ej. un bombo en cada negra) no hay forma de saber cuál es el
+  // tiempo fuerte: se usa el primer golpe audible, que es lo que se espera
+  if (tr.downbeatMargin < 0.3) return beats[i];
   for (let n = 0; n < bpb && i < beats.length - 1; n++) {
     if ((((i - tr.downbeatPhase) % bpb) + bpb) % bpb === 0) break;
     i++;
@@ -134,7 +137,20 @@ export default function App() {
   const [file, setFile] = useState<LoadedFile | null>(null);
   const [peaksOrig, setPeaksOrig] = useState<Peaks | null>(null);
   const [peaksAdj, setPeaksAdj] = useState<Peaks | null>(null);
-  const [markerSec, setMarkerSec] = useState(0);
+  // marcas puestas con clics (la primera es el "1"); sin marcas manda el marcador automático
+  const [marks, setMarks] = useState<number[]>([]);
+  const [autoMarker, setAutoMarker] = useState(0);
+  const markerSec = marks.length ? marks[0] : autoMarker;
+  const marksRef = useRef<number[]>([]);
+  marksRef.current = marks;
+  const autoRef = useRef(0);
+  autoRef.current = autoMarker;
+  const setMarkerSec = useCallback((v: number | ((m: number) => number)) => {
+    const cur = marksRef.current.length ? marksRef.current[0] : autoRef.current;
+    const nv = typeof v === "function" ? v(cur) : v;
+    if (marksRef.current.length) setMarks([nv, ...marksRef.current.slice(1)].sort((a, b) => a - b));
+    else setAutoMarker(nv);
+  }, []);
   const [cursorSec, setCursorSec] = useState(0);
   const [projectBPM, setProjectBPM] = useState(120);
   const [originalBPM, setOriginalBPM] = useState(120);
@@ -142,7 +158,7 @@ export default function App() {
   const [method, setMethod] = useState<StretchMethod>("wsola");
   const [embedTempo, setEmbedTempo] = useState(true);
   const [track, setTrack] = useState<BeatTrack | null>(null);
-  const [tempoMode, setTempoMode] = useState<"const" | "var" | "estefa">("const");
+  const [tempoMode, setTempoMode] = useState<"const" | "var" | "estefa" | "manual">("const");
   const [estefaStrength, setEstefaStrength] = useState(1);
   const [estefaPick, setEstefaPick] = useState(0);
   const [beatMult, setBeatMult] = useState<1 | 2 | 0.5>(1);
@@ -245,14 +261,23 @@ export default function App() {
         : null,
     [file, tempoMode, track, markerSec, beatLen, beatsPerBar, estefaStrength, estefaPick]
   );
+  const manualResult = useMemo(
+    () =>
+      file && tempoMode === "manual" && marks.length >= 2
+        ? variablePlan(marks, marks[0], beatLen, file.duration)
+        : null,
+    [file, tempoMode, marks, beatLen]
+  );
   const plan: WarpPlan = useMemo(
     () =>
       varResult?.plan ??
+      manualResult?.plan ??
       (estefaRes ? anchorPlan(estefaRes.anchors) : constantPlan(file ? file.duration : 1, factor)),
-    [varResult, estefaRes, file, factor]
+    [varResult, manualResult, estefaRes, file, factor]
   );
   // pulsos que se dibujan en la onda original: los detectados (variable) o la rejilla de Estefa
   const viewBeats = useMemo(() => {
+    if (tempoMode === "manual" && marks.length >= 2) return marks;
     if (tempoMode === "var" && track) return beatsAdj;
     if (tempoMode === "estefa" && estefaRes && file) {
       const out: number[] = [];
@@ -266,7 +291,7 @@ export default function App() {
       return out;
     }
     return undefined;
-  }, [tempoMode, track, beatsAdj, estefaRes, file, plan, markerSec, beatLen]);
+  }, [tempoMode, track, beatsAdj, estefaRes, file, plan, markerSec, beatLen, marks]);
   const beatZero = useMemo(() => {
     if (!viewBeats) return 0;
     let j = 0;
@@ -330,7 +355,8 @@ export default function App() {
     setPeaksOrig(peaks);
     setPeaksAdj(null);
     stretchedRef.current = null;
-    setMarkerSec(0);
+    setMarks([]);
+    setAutoMarker(0);
     setCursorSec(0);
     setTrack(null);
     setDetected(null);
@@ -355,7 +381,7 @@ export default function App() {
         const marker = firstDownbeat(tr, 4);
         autoMarkerRef.current = marker;
         setTrack(tr);
-        setMarkerSec(marker);
+        setAutoMarker(marker);
         setOriginalBPM(Math.round(tr.bpm * 100) / 100);
         setDetected({ firstBeat: marker, bpm: tr.bpm, conf: tr.confidence });
         const noPulse = tr.goodBeats < 8;
@@ -581,9 +607,70 @@ export default function App() {
   const onDetectFirst = useCallback(() => {
     if (!file || !track) return;
     const fb = firstDownbeat(track, beatsPerBar);
-    setMarkerSec(fb);
+    setMarks([]);
+    setAutoMarker(fb);
     setStatus("Primer tiempo fuerte: " + fb.toFixed(3) + " s");
   }, [file, track, beatsPerBar]);
+
+  /* ---------- marcas con clics ---------- */
+
+  const snapTimes = useMemo(() => (track ? track.onsets.map((o) => o.t) : undefined), [track]);
+
+  const addMark = useCallback(
+    (t: number) => {
+      if (!file) return;
+      const nt = clampMarker(t, file.duration);
+      const cur = marksRef.current;
+      if (cur.some((m) => Math.abs(m - nt) < 0.004)) return;
+      const next = [...cur, nt].sort((a, b) => a - b);
+      setMarks(next);
+      if (next.length === 1) {
+        setStatus(`Marca 1 en ${nt.toFixed(3)} s. Pon más marcas en los siguientes pulsos o usa Estefa.`);
+      } else if (next.length === 2) {
+        setTempoMode("manual");
+        setStatus("Marcas manuales: cada marca es un pulso. Estiro entre tus marcas.");
+      }
+    },
+    [file]
+  );
+  const removeMark = useCallback((t: number) => {
+    const cur = marksRef.current;
+    const next = cur.filter((m) => Math.abs(m - t) > 0.002);
+    setMarks(next);
+    if (next.length < 2) setTempoMode((m) => (m === "manual" ? "const" : m));
+    if (!next.length) setAutoMarker(autoRef.current);
+  }, []);
+  const moveMark = useCallback(
+    (from: number, to: number) => {
+      if (!file) return;
+      const nt = clampMarker(to, file.duration);
+      setMarks((cur) => cur.map((m) => (Math.abs(m - from) < 0.002 ? nt : m)).sort((a, b) => a - b));
+    },
+    [file]
+  );
+  const clearMarks = useCallback(() => {
+    setMarks([]);
+    setTempoMode((m) => (m === "manual" ? "const" : m));
+    setStatus("Marcas borradas");
+  }, []);
+
+  // con 2+ marcas, el BPM original sale de la distancia media entre ellas
+  useEffect(() => {
+    if (marks.length < 2) return;
+    const d: number[] = [];
+    for (let i = 1; i < marks.length; i++) d.push(marks[i] - marks[i - 1]);
+    d.sort((a, b) => a - b);
+    const med = d[Math.floor(d.length / 2)];
+    if (med > 0.05) setOriginalBPM(Math.min(300, Math.max(30, Math.round((60 / med) * 100) / 100)));
+  }, [marks]);
+
+  // "Ver toda la canción"
+  const fitAll = useCallback(() => {
+    if (!file) return;
+    const beats = file.duration / origBeatLen;
+    setZoom(Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, 600 / (beats + 1))));
+    setScrollBar(1 - markerSec / origBeatLen);
+  }, [file, origBeatLen, markerSec]);
 
   const bumpTempo = useCallback((k: 2 | 0.5) => {
     setBeatMult((m) => (m * k === 2 ? 2 : m * k === 0.5 ? 0.5 : m * k === 1 ? 1 : m));
@@ -810,19 +897,29 @@ export default function App() {
             {/* barra de herramientas */}
             <div className="flex items-center gap-2 flex-wrap">
               <W95Button
-                onClick={() => setZoom((z) => Math.max(24, z / 1.25))}
+                onClick={() => setZoom((z) => Math.max(ZOOM_MIN, z / 1.5))}
                 title="Alejar"
               >
                 −
               </W95Button>
               <W95Button
-                onClick={() => setZoom((z) => Math.min(2400, z * 1.25))}
+                onClick={() => setZoom((z) => Math.min(ZOOM_MAX, z * 1.5))}
                 title="Acercar"
               >
                 +
               </W95Button>
               <W95Field style={{ width: 90 }}>Zoom: {Math.round(zoom)}</W95Field>
+              <W95Button onClick={fitAll} disabled={!file} title="Ver toda la canción">
+                Ver todo
+              </W95Button>
               <W95Button onClick={() => setScrollBar(0)}>Ir al compás 1</W95Button>
+              <W95Button
+                onClick={clearMarks}
+                disabled={!marks.length}
+                title="Quitar todas las marcas y volver al marcador automático"
+              >
+                Borrar marcas ({marks.length})
+              </W95Button>
               <span className="w95-label mono">
                 Marcador: {markerSec.toFixed(4)} s
               </span>
@@ -877,7 +974,7 @@ export default function App() {
 
             {/* onda original */}
             <div className="w95-group-title">
-              Original (rojo = primer golpe, amarillo = cursor)
+              Original (rojo = primer golpe, naranja = marcas, amarillo = cursor)
             </div>
             <Waveform
               peaks={peaksOrig}
@@ -888,7 +985,12 @@ export default function App() {
               beatsPerBar={beatsPerBar}
               totalBars={origBars}
               markerSec={markerSec}
-              onMarkerChange={(t) => file && setMarkerSec(clampMarker(t, file.duration))}
+              marks={marks}
+              snapTimes={snapTimes}
+              editable
+              onAddMark={addMark}
+              onRemoveMark={removeMark}
+              onMoveMark={moveMark}
               cursorSec={cursorSec}
               onCursorChange={(t) => file && setCursorSec(clampMarker(t, file.duration))}
               zoom={zoom}
@@ -904,14 +1006,14 @@ export default function App() {
             </div>
             <Waveform
               peaks={peaksAdj}
-              originSec={pad}
+              originSec={markerOut}
               beatLenSec={beatLen}
               beatsPerBar={beatsPerBar}
               totalBars={outBars}
-              markerSec={pad}
-              onMarkerChange={(t) =>
-                file && setMarkerSec(clampMarker(plan.inv(Math.max(0, t - pad)), file.duration))
-              }
+              markerSec={markerOut}
+              peaksOffset={pad}
+              marks={marks.map((m) => plan.fwd(m) + pad)}
+              editable={false}
               cursorSec={plan.fwd(cursorSec) + pad}
               onCursorChange={(t) =>
                 file && setCursorSec(clampMarker(plan.inv(Math.max(0, t - pad)), file.duration))
@@ -926,13 +1028,13 @@ export default function App() {
             <HScrollbar
               value={scrollBar}
               min={-30}
-              max={Math.max(origBars, outBars) + 30}
+              max={Math.max(origBars, outBars) * beatsPerBar + 30}
               onChange={setScrollBar}
-              page={4}
+              page={Math.max(4, 620 / zoom)}
             />
             <div className="w95-label" style={{ color: "#404040" }}>
-              Rueda = zoom · clic = colocar marcador · arrastrar = mover ·
-              Mayús+arrastrar = desplazar
+              Rueda = zoom · clic = poner marca (se pega al golpe; Alt = sin imán) · clic en una marca =
+              quitarla · arrastrar una marca = moverla · Mayús+arrastrar = desplazar
             </div>
           </div>
         </Win95Window>
@@ -973,7 +1075,7 @@ export default function App() {
                 />
                 <W95Button
                   onClick={() => bumpTempo(0.5)}
-                  disabled={!file || tempoMode === "estefa"}
+                  disabled={!file || tempoMode === "estefa" || tempoMode === "manual"}
                   title="La lectura es el doble de rápida de lo que sientes: dividir entre 2"
                   style={{ minWidth: 0, padding: "3px 7px" }}
                 >
@@ -981,7 +1083,7 @@ export default function App() {
                 </W95Button>
                 <W95Button
                   onClick={() => bumpTempo(2)}
-                  disabled={!file || tempoMode === "estefa"}
+                  disabled={!file || tempoMode === "estefa" || tempoMode === "manual"}
                   title="La lectura es la mitad de rápida de lo que sientes: multiplicar por 2"
                   style={{ minWidth: 0, padding: "3px 7px" }}
                 >
@@ -1001,14 +1103,15 @@ export default function App() {
                 <W95Select
                   value={tempoMode}
                   onChange={(v) => {
-                    setTempoMode(v as "const" | "var" | "estefa");
+                    setTempoMode(v as "const" | "var" | "estefa" | "manual");
                     setEstefaPick(0);
                   }}
-                  disabled={!track}
+                  disabled={!track && marks.length < 2}
                   options={[
                     { value: "const", label: "Constante (un solo BPM)" },
                     { value: "var", label: "Seguir los pulsos (variable)" },
                     { value: "estefa", label: "Estefa (automático, sin BPM)" },
+                    { value: "manual", label: "Manual (mis marcas = pulsos)" },
                   ]}
                 />
               </div>
@@ -1327,6 +1430,7 @@ export default function App() {
                 ajústalo al tempo de tu proyecto y descárgalo sincronizado.
               </div>
               <div className="w95-label">· Lee los pulsos de toda la canción; si el tempo se mueve, alinea cada pulso a la rejilla</div>
+              <div className="w95-label">· Marcas con clics: se pegan al golpe, se quitan con otro clic; con 2 o más, tus marcas son los pulsos</div>
               <div className="w95-label">· Estefa: sin BPM de origen, decide el tempo natural y cuantiza elásticamente cada sonido</div>
               <div className="w95-label">· Estirado en un Web Worker: tres algoritmos, golpes anclados al compás</div>
               <div className="w95-label">· Estéreo intacto, misma frecuencia de muestreo</div>

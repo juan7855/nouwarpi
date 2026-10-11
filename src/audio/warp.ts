@@ -84,7 +84,7 @@ export function variablePlan(
   projBeatLen: number,
   dur: number
 ): { plan: WarpPlan; markerOut: number } | null {
-  if (beats.length < 4) return null;
+  if (beats.length < 2) return null;
   // el pulso más cercano al marcador pasa a ser exactamente el marcador
   let j = 0;
   for (let i = 1; i < beats.length; i++) if (Math.abs(beats[i] - markerSec) < Math.abs(beats[j] - markerSec)) j = i;
@@ -109,6 +109,6 @@ export function variablePlan(
   const tail = pts[pts.length - 1];
   const fEnd = projBeatLen / localLen(bs.length - 1);
   pts.push({ in: dur, out: tail.out + (dur - tail.in) * fEnd });
-  if (pts.length < 4) return null;
+  if (pts.length < 3) return null;
   return { plan: build("var", pts), markerOut };
 }
