@@ -641,7 +641,8 @@ export default function App() {
         eng.startMetronome({
           bpm: projectBPM,
           beatsPerBar,
-          outOffsetSec: startOut,
+          // si se arranca dentro del relleno inicial, el audio empieza (startCtx) en el instante `pad`
+          outOffsetSec: Math.max(startOut, pad),
           startCtxTime: startCtx,
         });
       }

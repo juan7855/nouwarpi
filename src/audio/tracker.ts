@@ -513,236 +513,308 @@ export function trackBeats(
   const onsets = validateOnsets(x, sr, onsetEvents(fine));
   const contentEnd = lastSound(x, sr);
 
-  // pulsos del DP → tiempo refinado
-  let beats = frames.map((f) => (f * o.hop + o.N * 0.7) / sr); // centro de la ventana de análisis
-  const refined = beats.map((b) => refineOnset(fine, b, 0.055));
-  // un ataque cuenta solo si es significativo frente al resto de pulsos (descarta el ruido de intros/colas)
-  const peaks = refined.filter((r) => r).map((r) => (r as { peak: number }).peak).sort((a, b) => a - b);
-  const peakMed = peaks.length ? peaks[Math.floor(peaks.length / 2)] : 0;
-  // y debe haber una subida real de energía (la escala logarítmica magnifica el rizado de un colchón
-  // de acordes en una intro y lo haría pasar por ataque)
-  const rmsWin = (a: number, b: number) => {
-    const i0 = Math.max(0, Math.floor(a * sr));
-    const i1 = Math.min(x.length, Math.floor(b * sr));
-    if (i1 <= i0) return 0;
-    let sum = 0;
-    for (let i = i0; i < i1; i++) sum += x[i] * x[i];
-    return Math.sqrt(sum / (i1 - i0));
-  };
-  const risesEnergy = (t: number) => {
-    const after = rmsWin(t, t + 0.03);
-    const before = rmsWin(t - 0.045, t - 0.005);
-    return after >= 1.15 * before || before < 1e-4;
-  };
-  const fineT: (number | null)[] = refined.map((r) => (r && r.peak >= 0.25 * peakMed && risesEnergy(r.t) ? r.t : null));
-  const shifts: number[] = [];
-  fineT.forEach((t, i) => t !== null && shifts.push(t - beats[i]));
-  shifts.sort((a, b) => a - b);
-  const medShift = shifts.length ? shifts[Math.floor(shifts.length / 2)] : 0;
-  beats = beats.map((b, i) => (fineT[i] !== null ? (fineT[i] as number) : b + medShift));
+  // pulsos del DP (solo sirven para elegir tempo/octava): se afinan con los ataques reales
+  const dpTimes = frames.map((f) => (f * o.hop + o.N * 0.7) / sr);
+  const dpDiffs: number[] = [];
+  for (let i = 1; i < dpTimes.length; i++) dpDiffs.push(dpTimes[i] - dpTimes[i - 1]);
+  dpDiffs.sort((a, b) => a - b);
+  const dpT = dpDiffs.length ? dpDiffs[Math.floor(dpDiffs.length / 2)] : period0;
 
-  // los pulsos duplicados o fuera de orden se eliminan
-  beats = beats.filter((b, i) => i === 0 || b - beats[i - 1] > period0 * 0.4);
-  if (beats.length < 4) {
-    const bpm = 60 / period0;
-    return {
-      beats: gridBeats(0, period0, dur),
-      beatGood: gridBeats(0, period0, dur).map(() => false),
-      bpm,
-      period: period0,
-      rmsMs: 0,
-      driftMs: 0,
-      constantOk: true,
-      confidence: 0,
-      downbeatPhase: 0,
-      downbeatMargin: 0,
-      firstSoundSec: firstSound(x, sr),
-      contentEnd,
-      goodBeats: 0,
-      onsets,
-    };
-  }
-
-  // pulsos con ataque real (el DP también coloca pulsos "fantasma" en tramos sin ataques)
-  const conf = fineT.map((t) => t !== null);
-  const diffs: number[] = [];
-  for (let i = 1; i < beats.length; i++) {
-    const d = beats[i] - beats[i - 1];
-    if (conf[i] && conf[i - 1] && d > period0 * 0.7 && d < period0 * 1.4) diffs.push(d);
-  }
-  diffs.sort((a, b) => a - b);
-  const T0 = diffs.length ? diffs[Math.floor(diffs.length / 2)] : period0;
-
-  // índice entero de cada pulso (puede haber saltos si el DP se saltó uno)
-  const ints: number[] = [];
-  let acc = 0;
-  for (let i = 0; i < beats.length; i++) {
-    acc = i === 0 ? 0 : acc + Math.max(1, Math.round((beats[i] - beats[i - 1]) / T0));
-    ints.push(acc);
-  }
-
-  // un pulso es bueno si tiene ataque y encaja en la recta LOCAL de sus vecinos buenos
-  // (±5 pulsos): vale para tempo constante y para tempo que varía poco a poco
-  const good = conf.slice();
-  let tol = 0.022;
-  for (let pass = 0; pass < 5; pass++) {
-    const next = good.slice();
-    const resAbs: number[] = [];
-    let changed = false;
-    for (let i = 0; i < beats.length; i++) {
-      if (!good[i]) continue;
-      const k: number[] = [];
-      const t: number[] = [];
-      for (let j = i - 1; j >= 0 && ints[i] - ints[j] <= 5; j--) if (good[j]) { k.push(ints[j]); t.push(beats[j]); }
-      for (let j = i + 1; j < beats.length && ints[j] - ints[i] <= 5; j++) if (good[j]) { k.push(ints[j]); t.push(beats[j]); }
-      let ok = pass > 0; // un pulso aislado se descarta al principio; después ya no (evita la cascada)
-      if (k.length >= 3) {
-        const f = fitLine(k, t);
-        const r = Math.abs(beats[i] - (f.t0 + f.T * ints[i]));
-        resAbs.push(r);
-        ok = r <= tol;
-      }
-      if (!ok) {
-        next[i] = false;
-        changed = true;
-      }
-    }
-    for (let i = 0; i < beats.length; i++) good[i] = next[i];
-    // tolerancia adaptativa: ~4× el desvío típico de esta canción (entre 7 y 22 ms)
-    if (resAbs.length > 8) {
-      resAbs.sort((a, b) => a - b);
-      tol = Math.min(0.022, Math.max(0.007, 4 * resAbs[Math.floor(resAbs.length / 2)]));
-    }
-    if (!changed && pass > 1) break;
-  }
-  // recorte de extremos: un pulso del borde solo vale si encaja con la recta de los 12 siguientes
-  // (evita que un falso ataque en una intro o una cola arrastre toda la extrapolación)
-  const trimTol = Math.max(0.01, tol * 1.5);
-  const trimEnd = (fromStart: boolean) => {
-    for (;;) {
-      const idx: number[] = [];
-      beats.forEach((_, i) => good[i] && idx.push(i));
-      if (idx.length < 14) return;
-      const edge = fromStart ? idx[0] : idx[idx.length - 1];
-      const inner = fromStart ? idx.slice(1, 13) : idx.slice(-13, -1);
-      const f = fitLine(inner.map((i) => ints[i]), inner.map((i) => beats[i]));
-      if (Math.abs(beats[edge] - (f.t0 + f.T * ints[edge])) > trimTol) good[edge] = false;
-      else return;
-    }
-  };
-  trimEnd(true);
-  trimEnd(false);
-
-  const gi: number[] = [];
-  const gt: number[] = [];
-  beats.forEach((b, i) => {
-    if (good[i]) {
-      gi.push(ints[i]);
-      gt.push(b);
-    }
+  const empty = (T: number): BeatTrack => ({
+    beats: gridBeats(0, T, dur),
+    beatGood: gridBeats(0, T, dur).map(() => false),
+    bpm: 60 / T,
+    period: T,
+    rmsMs: 0,
+    driftMs: 0,
+    constantOk: true,
+    confidence: 0,
+    downbeatPhase: 0,
+    downbeatMargin: 0,
+    firstSoundSec: firstSound(x, sr),
+    contentEnd,
+    goodBeats: 0,
+    onsets,
   });
-  if (gi.length < 6) {
-    const bpm = 60 / T0;
-    return {
-      beats: gridBeats(0, T0, dur),
-      beatGood: gridBeats(0, T0, dur).map(() => false),
-      bpm,
-      period: T0,
-      rmsMs: 0,
-      driftMs: 0,
-      constantOk: true,
-      confidence: 0,
-      downbeatPhase: 0,
-      downbeatMargin: 0,
-      firstSoundSec: firstSound(x, sr),
-      contentEnd,
-      goodBeats: 0,
-      onsets,
-    };
-  }
+  if (onsets.length < 8 || !(dpT > 0)) return empty(period0);
 
-  // ajuste de tempo (mínimos cuadrados con recorte de atípicos)
-  let useIdx = gi.map((_, i) => i);
-  let fit = fitLine(useIdx.map((i) => gi[i]), useIdx.map((i) => gt[i]));
-  for (let pass = 0; pass < 2; pass++) {
-    const res = gi.map((k, i) => gt[i] - (fit.t0 + fit.T * k));
-    const keep = useIdx.filter((i) => Math.abs(res[i]) < 0.03);
-    if (keep.length >= 6 && keep.length < useIdx.length) {
-      useIdx = keep;
-      fit = fitLine(useIdx.map((i) => gi[i]), useIdx.map((i) => gt[i]));
+  // 5a. tempo fino: coherencia de fase de los ataques reales (el pulso es lo que más se repite).
+  //     Alrededor del tempo del DP (±8 %) se busca el periodo con el que los ataques se alinean mejor.
+  const coh = (T: number) => {
+    let c = 0;
+    let s = 0;
+    let w = 0;
+    for (const e of onsets) {
+      const a = (2 * Math.PI * e.t) / T;
+      c += e.s * Math.cos(a);
+      s += e.s * Math.sin(a);
+      w += e.s;
+    }
+    return { R: w > 0 ? Math.hypot(c, s) / w : 0, ang: Math.atan2(s, c) };
+  };
+  let T = dpT;
+  {
+    const bpm0 = 60 / dpT;
+    let bestR = -1;
+    for (let bpm = bpm0 * 0.92; bpm <= bpm0 * 1.08; bpm += 0.01) {
+      const r = coh(60 / bpm).R;
+      if (r > bestR) {
+        bestR = r;
+        T = 60 / bpm;
+      }
     }
   }
-  const T = fit.T;
-  const resid = gi.map((k, i) => gt[i] - (fit.t0 + T * k));
-  // deriva = tendencia lenta (media móvil de 8 pulsos); jitter = lo que queda
-  const w = 8;
-  let drift = 0;
-  let jit = 0;
-  let jn = 0;
-  for (let i = 0; i < resid.length; i++) {
-    const a0 = Math.max(0, i - w / 2);
-    const a1 = Math.min(resid.length, i + w / 2);
-    let m = 0;
-    for (let k = a0; k < a1; k++) m += resid[k];
-    m /= a1 - a0;
-    drift = Math.max(drift, Math.abs(m));
-    jit += (resid[i] - m) * (resid[i] - m);
-    jn++;
-  }
-  const rms = Math.sqrt(jit / Math.max(1, jn));
+  const cg = coh(T);
+  const t0 = ((((cg.ang / (2 * Math.PI)) * T) % T) + T) % T;
 
-  // pulso en el entero k: dato real si es bueno; si no, interpolación (o extrapolación local en los extremos)
-  const byInt = new Map<number, number>();
-  gi.forEach((k, i) => byInt.set(k, gt[i]));
-  const timeAt = (k: number): number => {
-    const hit = byInt.get(k);
-    if (hit !== undefined) return hit;
-    if (k <= gi[0]) {
-      const m = Math.min(24, gi.length - 1) + 1;
-      const sl = fitLine(gi.slice(0, m), gt.slice(0, m)).T;
-      return gt[0] + (k - gi[0]) * sl;
+  // 5b. seguimiento local de fase: cada pulso se coloca donde se agrupan los ataques cercanos
+  //     (ventana gaussiana de ~2,5 pulsos). Sigue la deriva del tempo de una grabación en vivo sin
+  //     pegar cada pulso a un golpe suelto (se conserva el groove y el swing). Arranca de la cadena
+  //     del DP, que ya sigue los cambios de tempo.
+  const kmin = -Math.floor(t0 / T) - 4;
+  const kmax = Math.floor((dur - t0) / T) + 4;
+  const nb = kmax - kmin + 1;
+  if (nb < 4) return empty(T);
+  const delta = new Float64Array(nb);
+  const have = new Uint8Array(nb);
+  const gridT = (k: number) => t0 + (k + kmin) * T;
+  const fillGaps = () => {
+    let last = -1;
+    for (let k = 0; k < nb; k++) {
+      if (!have[k]) continue;
+      if (last < 0) for (let j = 0; j < k; j++) delta[j] = delta[k];
+      else if (k - last > 1) for (let j = last + 1; j < k; j++) delta[j] = delta[last] + ((delta[k] - delta[last]) * (j - last)) / (k - last);
+      last = k;
     }
-    if (k >= gi[gi.length - 1]) {
-      const n = gi.length - 1;
-      const m = Math.max(0, n - 24);
-      const sl = fitLine(gi.slice(m), gt.slice(m)).T;
-      return gt[n] + (k - gi[n]) * sl;
+    if (last >= 0) for (let j = last + 1; j < nb; j++) delta[j] = delta[last];
+  };
+  {
+    // índice entero de cada pulso del DP respecto a la rejilla
+    let kk = Math.round((dpTimes[0] - t0) / T) - kmin;
+    for (let j = 0; j < dpTimes.length; j++) {
+      if (j > 0) kk += Math.max(1, Math.round((dpTimes[j] - dpTimes[j - 1]) / dpT));
+      if (kk < 0 || kk >= nb) continue;
+      delta[kk] = dpTimes[j] - gridT(kk);
+      have[kk] = 1;
     }
+    fillGaps();
+    // los extremos de la cadena del DP a veces caen en un charles: mediana de ±3 vecinos
+    const med = new Float64Array(nb);
+    for (let k = 0; k < nb; k++) {
+      const v: number[] = [];
+      for (let j = Math.max(0, k - 3); j <= Math.min(nb - 1, k + 3); j++) v.push(delta[j]);
+      v.sort((a, b) => a - b);
+      med[k] = v[v.length >> 1];
+    }
+    for (let k = 0; k < nb; k++) delta[k] = med[k];
+  }
+  const pos = (k: number) => gridT(k) + delta[k];
+  const nearestBeat = (t: number) => {
     let lo = 0;
-    let hi = gi.length - 1;
+    let hi = nb - 1;
     while (hi - lo > 1) {
       const mid = (lo + hi) >> 1;
-      if (gi[mid] <= k) lo = mid;
+      if (pos(mid) <= t) lo = mid;
       else hi = mid;
     }
-    return gt[lo] + ((gt[hi] - gt[lo]) * (k - gi[lo])) / (gi[hi] - gi[lo]);
+    return Math.abs(pos(lo) - t) <= Math.abs(pos(hi) - t) ? lo : hi;
   };
+  const sigma = 2.5;
+  const W = 8;
+  // por pulso: lista de (residuo, peso) de los ataques que caen cerca; el desplazamiento nuevo es el
+  // PICO de densidad de esos residuos (el golpe que se repite en el pulso), no su media: una síncopa o
+  // un charles suelto no arrastran el pulso
+  const track = (iters: number) => {
+    for (let it = 0; it < iters; it++) {
+      const rs: number[][] = Array.from({ length: nb }, () => []);
+      const ws: number[][] = Array.from({ length: nb }, () => []);
+      for (const e of onsets) {
+        const k = nearestBeat(e.t);
+        const r = e.t - pos(k);
+        const loc = k > 0 && k < nb - 1 ? Math.min(pos(k + 1) - pos(k), pos(k) - pos(k - 1)) : T;
+        if (Math.abs(r) > 0.25 * loc) continue; // contratiempos y subdivisiones no deciden el pulso
+        rs[k].push(r);
+        ws[k].push(e.s);
+      }
+      const upd = new Float64Array(nb);
+      have.fill(0);
+      const sr2 = 0.012;
+      for (let k = 0; k < nb; k++) {
+        const cr: number[] = [];
+        const cw: number[] = [];
+        let wsum = 0;
+        for (let j = Math.max(0, k - W); j <= Math.min(nb - 1, k + W); j++) {
+          const g = Math.exp(-0.5 * Math.pow((j - k) / sigma, 2));
+          for (let q = 0; q < rs[j].length; q++) {
+            cr.push(rs[j][q]); // residuo respecto a su propio pulso
+            cw.push(g * ws[j][q]);
+            wsum += g * ws[j][q];
+          }
+        }
+        if (wsum <= 0.6) continue;
+        const lim = 0.25 * T;
+        let bestX = 0;
+        let bestD = -1;
+        for (let x = -lim; x <= lim; x += 0.002) {
+          let d = 0;
+          for (let q = 0; q < cr.length; q++) {
+            const z = (cr[q] - x) / sr2;
+            if (z > -3.5 && z < 3.5) d += cw[q] * Math.exp(-0.5 * z * z);
+          }
+          d *= Math.exp(-0.5 * Math.pow(x / 0.045, 2)); // preferencia por quedarse donde ya estaba el pulso
+          if (d > bestD) {
+            bestD = d;
+            bestX = x;
+          }
+        }
+        // media local alrededor del pico (precisión por debajo de 2 ms)
+        let ns = 0;
+        let ds = 0;
+        for (let q = 0; q < cr.length; q++) {
+          if (Math.abs(cr[q] - bestX) <= 0.015) {
+            ns += cw[q] * cr[q];
+            ds += cw[q];
+          }
+        }
+        // con poca evidencia (bordes, colas) el pulso apenas se mueve: no se fía de un par de golpes sueltos
+        upd[k] = (ds > 0 ? ns / ds : bestX) * (wsum / (wsum + 1.5));
+        have[k] = 1;
+      }
+      for (let k = 0; k < nb; k++) if (have[k]) delta[k] += upd[k];
+      fillGaps(); // sin ataques cerca (intros, colas, huecos) se interpola/mantiene el desplazamiento
+      // un pulso que salta solo (enganchado a un charles) se corrige con la mediana de sus vecinos
+      const med = new Float64Array(nb);
+      for (let k = 0; k < nb; k++) {
+        const v: number[] = [];
+        for (let j = Math.max(0, k - 2); j <= Math.min(nb - 1, k + 2); j++) v.push(delta[j]);
+        v.sort((a, b) => a - b);
+        med[k] = v[v.length >> 1];
+      }
+      for (let k = 0; k < nb; k++) delta[k] = med[k];
+    }
+  };
+  track(4);
+  // ¿pulso o contratiempo? gana la fase donde caen más golpes de cuerpo (bombo, caja, bajo)
+  {
+    const sc = (shift: number) => {
+      let s = 0;
+      for (let k = 0; k < nb; k++) {
+        const t = pos(k) + shift;
+        if (t < 0 || t > dur) continue;
+        const fr = Math.round((t * sr - o.N * 0.7) / o.hop);
+        let m = 0;
+        for (let d = -3; d <= 3; d++) if (fr + d >= 0 && fr + d < o0.body.length) m = Math.max(m, o0.body[fr + d]);
+        s += m;
+      }
+      return s;
+    };
+    if (sc(T / 2) > 1.15 * sc(0)) {
+      for (let k = 0; k < nb; k++) delta[k] += T / 2;
+      track(3);
+    }
+  }
   const full: number[] = [];
-  let kStart = gi[0];
-  while (timeAt(kStart - 1) >= 0) kStart--;
-  let kEnd = gi[gi.length - 1];
-  while (timeAt(kEnd + 1) < dur) kEnd++;
-  const fullGood: boolean[] = [];
-  for (let k = kStart; k <= kEnd; k++) {
-    full.push(timeAt(k));
-    fullGood.push(byInt.has(k));
+  let kStartIdx = -1;
+  for (let k = 0; k < nb; k++) {
+    const b = pos(k);
+    if (b < 0 || b >= dur) continue;
+    if (kStartIdx < 0) kStartIdx = k;
+    full.push(b);
+  }
+  if (full.length < 4) return empty(T);
+  const kStartAbs = kStartIdx + kmin;
+
+  // un pulso es "bueno" si cae sobre un ataque real y su vecindad está bien cubierta
+  const fullGood: boolean[] = full.map((b) => {
+    if (b < firstSound(x, sr) - 0.1 || b > contentEnd + 0.1) return false;
+    for (const e of onsets) {
+      if (e.t < b - 0.045) continue;
+      if (e.t > b + 0.045) break;
+      if (e.s >= 0.25) return true;
+    }
+    return false;
+  });
+  // recorte de extremos: un pulso del borde solo vale si encaja con la recta de los vecinos buenos
+  // (un golpe suelto en una intro o una cola no arrastra la extrapolación)
+  {
+    const trimTol = Math.max(0.02, 0.1 * T);
+    const edgeTrim = (fromStart: boolean) => {
+      for (;;) {
+        const idx: number[] = [];
+        fullGood.forEach((g, i) => g && idx.push(i));
+        if (idx.length < 10) return;
+        const edge = fromStart ? idx[0] : idx[idx.length - 1];
+        const inner = fromStart ? idx.slice(1, 9) : idx.slice(-9, -1);
+        const f = fitLine(inner, inner.map((i) => full[i]));
+        if (Math.abs(full[edge] - (f.t0 + f.T * edge)) > trimTol) fullGood[edge] = false;
+        else return;
+      }
+    };
+    edgeTrim(true);
+    edgeTrim(false);
+    // fuera de los pulsos buenos: extrapolación con la pendiente local (no se arrastra el desvío del borde)
+    const gI: number[] = [];
+    fullGood.forEach((g, i) => g && gI.push(i));
+    if (gI.length >= 6) {
+      const m = Math.min(16, gI.length);
+      const head = gI.slice(0, m);
+      const tail = gI.slice(-m);
+      const fh = fitLine(head, head.map((i) => full[i]));
+      const ft = fitLine(tail, tail.map((i) => full[i]));
+      for (let i = 0; i < gI[0]; i++) full[i] = full[gI[0]] + (i - gI[0]) * fh.T;
+      for (let i = gI[gI.length - 1] + 1; i < full.length; i++) full[i] = full[gI[gI.length - 1]] + (i - gI[gI.length - 1]) * ft.T;
+    }
+  }
+  const goodN = fullGood.filter(Boolean).length;
+  if (goodN < 6) return empty(T);
+
+  // tempo medio y desvío respecto a una recta (cuánto se mueve el tempo)
+  const gIdx: number[] = [];
+  const gT: number[] = [];
+  full.forEach((b, k) => {
+    if (fullGood[k]) {
+      gIdx.push(k);
+      gT.push(b);
+    }
+  });
+  const fit = fitLine(gIdx, gT);
+  const resid = gIdx.map((k, i) => gT[i] - (fit.t0 + fit.T * k));
+  let drift = 0;
+  let ss = 0;
+  for (let i = 0; i < resid.length; i++) {
+    ss += resid[i] * resid[i];
+    const a0 = Math.max(0, i - 4);
+    const a1 = Math.min(resid.length, i + 4);
+    let m = 0;
+    for (let k = a0; k < a1; k++) m += resid[k];
+    drift = Math.max(drift, Math.abs(m / (a1 - a0)));
+  }
+  const rms = Math.sqrt(ss / resid.length);
+
+  // si un tempo constante explica los pulsos (deriva < 8 ms), la recta de mínimos cuadrados es más
+  // precisa que cualquier pulso suelto: se usa para TODOS los pulsos
+  const constantOk = drift < 0.008 && rms < 0.008;
+  const bpmOut = 60 / fit.T;
+  const periodOut = fit.T;
+  if (constantOk) {
+    // k de cada pulso de `full` respecto a la recta ajustada
+    for (let k = 0; k < full.length; k++) full[k] = fit.t0 + fit.T * k;
   }
 
   // tiempo fuerte: la fase del compás con más ataque grave
   const phaseScore = new Array(beatsPerBar).fill(0);
   full.forEach((b, i) => {
-    const fr = Math.round((b * sr) / o.hop);
+    const fr = Math.round((b * sr - o.N * 0.7) / o.hop);
     let s = 0;
-    for (let d = -1; d <= 1; d++) {
+    for (let d = -2; d <= 2; d++) {
       const j = fr + d;
       if (j >= 0 && j < o.env.length) s += o.low[j] * 1.0 + o.env[j] * 0.35;
     }
-    phaseScore[(((i + kStart) % beatsPerBar) + beatsPerBar) % beatsPerBar] += s;
+    phaseScore[(((i + kStartAbs) % beatsPerBar) + beatsPerBar) % beatsPerBar] += s;
   });
   let phase = 0;
   for (let p = 1; p < beatsPerBar; p++) if (phaseScore[p] > phaseScore[phase]) phase = p;
-  // el índice de fase se expresa respecto al primer elemento de `full`
-  const downbeatPhase = (((phase - kStart) % beatsPerBar) + beatsPerBar) % beatsPerBar;
+  const downbeatPhase = (((phase - kStartAbs) % beatsPerBar) + beatsPerBar) % beatsPerBar;
   const sortedPh = phaseScore.slice().sort((a, b) => b - a);
   const downbeatMargin = sortedPh[0] > 0 ? (sortedPh[0] - sortedPh[1]) / sortedPh[0] : 0;
 
@@ -750,17 +822,17 @@ export function trackBeats(
   return {
     beats: full,
     beatGood: fullGood,
-    bpm: 60 / T,
-    period: T,
+    bpm: bpmOut,
+    period: periodOut,
     rmsMs: rms * 1000,
     driftMs: drift * 1000,
-    constantOk: drift < 0.02 && rms < 0.015,
-    confidence,
+    constantOk,
+    confidence: Math.max(confidence, Math.min(1, cg.R * 2)),
     downbeatPhase,
     downbeatMargin,
     firstSoundSec: firstSound(x, sr),
     contentEnd,
-    goodBeats: gi.length,
+    goodBeats: goodN,
     onsets,
   };
 }
