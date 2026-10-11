@@ -1,10 +1,19 @@
 // Codificación WAV sin pérdida: 24 bits PCM o 32 bits flotante,
 // a la misma frecuencia de muestreo y canales del original.
+// Opcionalmente incrusta el chunk "acid" (tempo y nº de pulsos), que leen
+// muchos DAWs y samplers para saber el BPM de un loop.
+
+export interface WavTempoMeta {
+  bpm: number;
+  beats: number; // pulsos totales del loop
+  beatsPerBar: number;
+}
 
 export function encodeWav(
   channels: Float32Array[],
   sampleRate: number,
-  bitDepth: 24 | 32
+  bitDepth: 24 | 32,
+  meta?: WavTempoMeta
 ): Blob {
   const numCh = channels.length;
   const numSamples = channels[0].length;
@@ -13,29 +22,64 @@ export function encodeWav(
   const byteRate = sampleRate * blockAlign;
   const dataSize = numSamples * blockAlign;
 
-  const headerSize = 12 + 8 + 16 + 8; // RIFF + fmt + data headers
-  const buffer = new ArrayBuffer(headerSize + dataSize);
-  const dv = new DataView(buffer);
+  const fmtSize = isFloat ? 18 : 16;
+  const factSize = isFloat ? 12 : 0; // el formato float exige chunk "fact"
+  const acidSize = meta ? 8 + 24 : 0;
+  const headerSize = 12 + 8 + fmtSize + factSize + acidSize + 8;
+  const total = headerSize + dataSize + (dataSize & 1);
 
-  const writeStr = (off: number, s: string) => {
-    for (let i = 0; i < s.length; i++) dv.setUint8(off + i, s.charCodeAt(i));
+  const buffer = new ArrayBuffer(total);
+  const dv = new DataView(buffer);
+  let p = 0;
+  const str = (s: string) => {
+    for (let i = 0; i < s.length; i++) dv.setUint8(p++, s.charCodeAt(i));
+  };
+  const u32 = (v: number) => {
+    dv.setUint32(p, v, true);
+    p += 4;
+  };
+  const u16 = (v: number) => {
+    dv.setUint16(p, v, true);
+    p += 2;
+  };
+  const f32 = (v: number) => {
+    dv.setFloat32(p, v, true);
+    p += 4;
   };
 
-  writeStr(0, "RIFF");
-  dv.setUint32(4, 36 + dataSize, true);
-  writeStr(8, "WAVE");
-  writeStr(12, "fmt ");
-  dv.setUint32(16, 16, true);
-  dv.setUint16(20, isFloat ? 3 : 1, true); // formato
-  dv.setUint16(22, numCh, true);
-  dv.setUint32(24, sampleRate, true);
-  dv.setUint32(28, byteRate, true);
-  dv.setUint16(32, blockAlign, true);
-  dv.setUint16(34, bitDepth, true);
-  writeStr(36, "data");
-  dv.setUint32(40, dataSize, true);
+  str("RIFF");
+  u32(total - 8);
+  str("WAVE");
+  str("fmt ");
+  u32(fmtSize);
+  u16(isFloat ? 3 : 1);
+  u16(numCh);
+  u32(sampleRate);
+  u32(byteRate);
+  u16(blockAlign);
+  u16(bitDepth);
+  if (isFloat) u16(0); // cbSize
+  if (isFloat) {
+    str("fact");
+    u32(4);
+    u32(numSamples);
+  }
+  if (meta) {
+    str("acid");
+    u32(24);
+    u32(0); // flags: loop (no one-shot)
+    u16(60); // nota raíz (sin uso)
+    u16(0x8000);
+    f32(0);
+    u32(Math.max(1, Math.round(meta.beats)));
+    u16(4); // denominador del compás
+    u16(meta.beatsPerBar);
+    f32(meta.bpm);
+  }
+  str("data");
+  u32(dataSize);
 
-  let off = headerSize;
+  let off = p;
   for (let i = 0; i < numSamples; i++) {
     for (let c = 0; c < numCh; c++) {
       let v = channels[c][i];

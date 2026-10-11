@@ -16,9 +16,13 @@ import {
   computeOnsetEnvelope,
   detectFirstBeat,
   detectBpmFrom,
+  refineFirstBeat,
+  refineBpm,
   OnsetEnvelope,
 } from "./audio/analysis";
-import { phaseVocoderStretch } from "./audio/pvoc";
+import { Processor, CANCELLED } from "./audio/processor";
+import { decodeAudioFile } from "./audio/decode";
+import type { StretchMethod } from "./audio/stretch";
 import { encodeWav, maxAbs } from "./audio/wav";
 import { formatTime } from "./audio/dsp";
 
@@ -48,19 +52,15 @@ function computePeaks(buf: AudioBuffer, bucket: number): Peaks {
   return { min, max, bucket, samples: len, sampleRate: buf.sampleRate };
 }
 
-function resamplePeaks(p: Peaks, factor: number): Peaks {
-  const nB = Math.max(1, Math.ceil((p.samples * factor) / p.bucket));
-  const min = new Float32Array(nB).fill(1);
-  const max = new Float32Array(nB).fill(-1);
-  for (let b = 0; b < nB; b++) {
-    const b0 = Math.floor(b / factor);
-    const b1 = Math.max(b0 + 1, Math.ceil((b + 1) / factor));
-    for (let i = b0; i < Math.min(b1, p.min.length); i++) {
-      if (p.min[i] < min[b]) min[b] = p.min[i];
-      if (p.max[i] > max[b]) max[b] = p.max[i];
-    }
+function mixToMono(buf: AudioBuffer): Float32Array {
+  const n = buf.length;
+  const out = new Float32Array(n);
+  for (let c = 0; c < buf.numberOfChannels; c++) {
+    const d = buf.getChannelData(c);
+    for (let i = 0; i < n; i++) out[i] += d[i];
   }
-  return { min, max, bucket: p.bucket, samples: Math.round(p.samples * factor), sampleRate: p.sampleRate };
+  if (buf.numberOfChannels > 1) for (let i = 0; i < n; i++) out[i] /= buf.numberOfChannels;
+  return out;
 }
 
 const clampMarker = (t: number, max: number) => Math.max(0, Math.min(max, t));
@@ -131,7 +131,8 @@ export default function App() {
   const [projectBPM, setProjectBPM] = useState(120);
   const [originalBPM, setOriginalBPM] = useState(120);
   const [beatsPerBar, setBeatsPerBar] = useState(4);
-  const [keepPitch, setKeepPitch] = useState(true);
+  const [method, setMethod] = useState<StretchMethod>("wsola");
+  const [embedTempo, setEmbedTempo] = useState(true);
   const [metronomeOn, setMetronomeOn] = useState(false);
   const [exportMode, setExportMode] = useState<"all" | "beat" | "sel">("all");
   const [selStart, setSelStart] = useState(1);
@@ -179,8 +180,11 @@ export default function App() {
   const [exportBusy, setExportBusy] = useState(false);
 
   const envRef = useRef<OnsetEnvelope | null>(null);
+  const monoRef = useRef<Float32Array | null>(null);
   const stretchedRef = useRef<AudioBuffer | null>(null);
   const procToken = useRef(0);
+  const processorRef = useRef<Processor | null>(null);
+  if (!processorRef.current) processorRef.current = new Processor();
   const tapsRef = useRef<number[]>([]);
   const rafRef = useRef<number>(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -197,8 +201,8 @@ export default function App() {
   const origBarLen = origBeatLen * beatsPerBar;
   const pad = useMemo(() => {
     if (!file) return 0;
-    const m = markerSec * factor;
-    return (barLen - (m % barLen)) % barLen;
+    const r = (markerSec * factor) % barLen;
+    return r < 1e-6 || barLen - r < 1e-6 ? 0 : barLen - r;
   }, [file, markerSec, factor, barLen]);
   const stretchedDur = file ? file.duration * factor : 0;
   const totalOut = pad + stretchedDur;
@@ -206,6 +210,8 @@ export default function App() {
   const origBars = file ? Math.max(1, Math.ceil(file.duration / origBarLen - 1e-9)) : 0;
   const tempoChangePct = (factor - 1) * 100;
   const tempoWarn = Math.abs(tempoChangePct) > 25;
+
+  const markerOut = pad + markerSec * factor; // el primer golpe, siempre en una línea de compás
 
   const exportPlan = useMemo(() => {
     if (!file) return null;
@@ -215,8 +221,8 @@ export default function App() {
       startOut = 0;
       lengthOut = outBars * barLen;
     } else if (exportMode === "beat") {
-      startOut = pad;
-      lengthOut = Math.ceil(stretchedDur / barLen - 1e-9) * barLen;
+      startOut = markerOut;
+      lengthOut = Math.max(1, Math.ceil((totalOut - markerOut) / barLen - 1e-9)) * barLen;
     } else {
       startOut = (selStart - 1) * barLen;
       lengthOut = (selEnd - selStart + 1) * barLen;
@@ -229,7 +235,7 @@ export default function App() {
         .toLowerCase() || "audio";
     const fname = `${base}_${Math.round(projectBPM)}bpm_${barCount}compases.wav`;
     return { startOut, lengthOut, barCount, fname };
-  }, [file, exportMode, outBars, barLen, pad, stretchedDur, selStart, selEnd, projectBPM]);
+  }, [file, exportMode, outBars, barLen, markerOut, totalOut, selStart, selEnd, projectBPM]);
 
   /* ---------- carga de archivo ---------- */
 
@@ -243,10 +249,13 @@ export default function App() {
       channels: buf.numberOfChannels,
     };
     const peaks = computePeaks(buf, 256);
-    const env = computeOnsetEnvelope(buf.getChannelData(0), buf.sampleRate);
+    const mono = mixToMono(buf);
+    monoRef.current = mono;
+    const env = computeOnsetEnvelope(mono, buf.sampleRate);
     envRef.current = env;
-    const fb = detectFirstBeat(env);
+    const fb = refineFirstBeat(mono, buf.sampleRate, detectFirstBeat(env));
     const bpmRes = detectBpmFrom(env, fb);
+    bpmRes.bpm = Math.round(refineBpm(mono, buf.sampleRate, fb, bpmRes.bpm) * 100) / 100;
     setFile(info);
     setPeaksOrig(peaks);
     setPeaksAdj(null);
@@ -270,9 +279,7 @@ export default function App() {
     async (f: File) => {
       setStatus("Cargando…");
       try {
-        const ab = await f.arrayBuffer();
-        const ctx = new OfflineAudioContext(1, 1, 44100);
-        const buf = await ctx.decodeAudioData(ab);
+        const buf = await decodeAudioFile(f);
         loadBuffer(buf, f.name);
       } catch {
         setStatus("Error: no se pudo decodificar el audio.");
@@ -287,56 +294,55 @@ export default function App() {
     loadBuffer(buf, "demo_100bpm.wav");
   }, [loadBuffer]);
 
-  /* ---------- procesado (vocoder) ---------- */
+  /* ---------- procesado (Web Worker) ---------- */
 
   useEffect(() => {
     if (!file) return;
     const token = ++procToken.current;
+    const processor = processorRef.current!;
     const t = setTimeout(async () => {
+      if (Math.abs(factor - 1) < 0.0005) {
+        stretchedRef.current = file.buffer;
+        setPeaksAdj(peaksOrig);
+        setClipWarn(null);
+        setProc({ active: false, label: "", frac: 0 });
+        setStatus("Listo");
+        return;
+      }
       setProc({ active: true, label: "Procesando…", frac: 0 });
       setStatus("Procesando…");
-      const f = factor;
-      let stretched: AudioBuffer;
-      if (keepPitch) {
-        if (Math.abs(f - 1) < 0.002) {
-          stretched = file.buffer;
-        } else {
-          stretched = await phaseVocoderStretch(file.buffer, f, (p) => {
-            if (token === procToken.current)
-              setProc({ active: true, label: p.label, frac: p.frac });
-          });
-        }
-      } else {
-        stretched = file.buffer;
-      }
-      if (token !== procToken.current) return;
-      stretchedRef.current = keepPitch ? stretched : null;
-      const adj = keepPitch
-        ? stretched === file.buffer
-          ? peaksOrig
-          : computePeaks(stretched, 256)
-        : peaksOrig
-          ? resamplePeaks(peaksOrig, f)
-          : null;
-      setPeaksAdj(adj);
-      if (keepPitch && stretched !== file.buffer) {
+      try {
         const chs: Float32Array[] = [];
-        for (let c = 0; c < stretched.numberOfChannels; c++)
-          chs.push(stretched.getChannelData(c));
-        const m = maxAbs(chs);
+        for (let c = 0; c < file.channels; c++) chs.push(file.buffer.getChannelData(c).slice());
+        const out = await processor.run(chs, file.sampleRate, factor, method, (frac) => {
+          if (token === procToken.current) setProc({ active: true, label: "Procesando…", frac });
+        });
+        if (token !== procToken.current) return;
+        const buf = new AudioBuffer({
+          length: out[0].length,
+          sampleRate: file.sampleRate,
+          numberOfChannels: out.length,
+        });
+        for (let c = 0; c < out.length; c++) buf.copyToChannel(out[c] as Float32Array<ArrayBuffer>, c);
+        stretchedRef.current = buf;
+        setPeaksAdj(computePeaks(buf, 256));
+        const m = maxAbs(out);
         setClipWarn(m > 0.999 ? m : null);
-      } else {
-        setClipWarn(null);
+        setProc({ active: false, label: "", frac: 0 });
+        setStatus("Listo");
+      } catch (e) {
+        if (e instanceof Error && e.message === CANCELLED) return;
+        setProc({ active: false, label: "", frac: 0 });
+        setStatus("Error al procesar: " + (e instanceof Error ? e.message : "desconocido"));
       }
-      setProc({ active: false, label: "", frac: 0 });
-      setStatus("Listo");
     }, 350);
     return () => {
       clearTimeout(t);
       procToken.current++;
+      processor.cancel();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [file, originalBPM, projectBPM, keepPitch, factor]);
+  }, [file, factor, method]);
 
   /* ---------- reproducción ---------- */
 
@@ -356,31 +362,21 @@ export default function App() {
       const f = factor;
       let buffer: AudioBuffer;
       let offsetSrc: number;
-      let rate = 1;
 
       if (mode === "adj") {
-        if (keepPitch) {
-          const sb = stretchedRef.current;
-          if (!sb) {
-            setStatus("Aún procesando…");
-            return;
-          }
-          buffer = sb;
-          offsetSrc = startOut - pad;
-          rate = 1;
-        } else {
-          buffer = file.buffer;
-          offsetSrc = (startOut - pad) / f;
-          rate = 1 / f;
+        const sb = stretchedRef.current;
+        if (!sb) {
+          setStatus("Aún procesando…");
+          return;
         }
+        buffer = sb;
+        offsetSrc = startOut - pad;
       } else {
         buffer = file.buffer;
         offsetSrc = (startOut - pad) / f;
-        rate = 1;
       }
 
-      const srcFromOut = (o: number) =>
-        mode === "adj" && keepPitch ? o - pad : (o - pad) / f;
+      const srcFromOut = (o: number) => (mode === "adj" ? o - pad : (o - pad) / f);
 
       let loopStartSrc: number | undefined;
       let loopEndSrc: number | undefined;
@@ -396,7 +392,7 @@ export default function App() {
       const startCtx = eng.play({
         buffer,
         offsetSec: offsetSrc,
-        rate,
+        rate: 1,
         loopStartSec: loopStartSrc,
         loopEndSec: loopEndSrc,
         onEnded: () => {
@@ -431,7 +427,7 @@ export default function App() {
         mode === "adj" ? "Reproduciendo: ajustado" : "Reproduciendo: original"
       );
     },
-    [file, factor, keepPitch, pad, loopOn, loopBars, barLen, metronomeOn, projectBPM, beatsPerBar]
+    [file, factor, pad, loopOn, loopBars, barLen, metronomeOn, projectBPM, beatsPerBar]
   );
 
   const onCompare = useCallback(() => {
@@ -464,6 +460,9 @@ export default function App() {
     const env = envRef.current;
     if (!env) return;
     const r = detectBpmFrom(env, markerSec);
+    if (monoRef.current && file) {
+      r.bpm = Math.round(refineBpm(monoRef.current, file.sampleRate, markerSec, r.bpm) * 100) / 100;
+    }
     setOriginalBPM(r.bpm);
     setIrregular(!r.stable);
     setStatus(
@@ -471,12 +470,13 @@ export default function App() {
         ? "Aviso: tempo irregular o con cambios."
         : `BPM detectado: ${r.bpm} (confianza ${Math.round(r.confidence * 100)}%)`
     );
-  }, [markerSec]);
+  }, [markerSec, file]);
 
   const onDetectFirst = useCallback(() => {
     const env = envRef.current;
     if (!env || !file) return;
-    const fb = detectFirstBeat(env);
+    let fb = detectFirstBeat(env);
+    if (monoRef.current) fb = refineFirstBeat(monoRef.current, file.sampleRate, fb);
     setMarkerSec(fb);
     setStatus("Primer golpe detectado: " + fb.toFixed(3) + " s");
   }, [file]);
@@ -504,50 +504,40 @@ export default function App() {
     setExportBusy(true);
     setStatus("Exportando…");
     try {
-      const f = factor;
       const sr = file.sampleRate;
       const { startOut, lengthOut, fname } = exportPlan;
       const lengthSamples = Math.max(1, Math.round(lengthOut * sr));
 
-      let channels: Float32Array[];
-      if (keepPitch) {
-        const sb = stretchedRef.current;
-        if (!sb) {
-          setStatus("Aún procesando…");
-          return;
-        }
-        // puede haber silencio inicial (intro) si startOut < pad
-        const srcStartF = (startOut - pad) * sr;
-        const dstSkip = Math.max(0, Math.round(-srcStartF));
-        const srcStart = Math.max(0, Math.round(srcStartF));
-        channels = [];
-        for (let c = 0; c < sb.numberOfChannels; c++) {
-          const src = sb.getChannelData(c);
-          const dst = new Float32Array(lengthSamples);
-          const avail = Math.max(0, src.length - srcStart);
-          const n = Math.min(lengthSamples - dstSkip, avail);
-          if (n > 0) dst.set(src.subarray(srcStart, srcStart + n), dstSkip);
-          channels.push(dst);
-        }
-      } else {
-        const off = new OfflineAudioContext(file.channels, lengthSamples, sr);
-        const srcNode = off.createBufferSource();
-        srcNode.buffer = file.buffer;
-        srcNode.playbackRate.value = 1 / f;
-        srcNode.connect(off.destination);
-        const off0 = (startOut - pad) / f;
-        const delay = Math.max(0, -off0);
-        srcNode.start(delay, Math.max(0, off0));
-        const rendered = await off.startRendering();
-        channels = [];
-        for (let c = 0; c < rendered.numberOfChannels; c++)
-          channels.push(rendered.getChannelData(c).slice());
+      const sb = stretchedRef.current;
+      if (!sb) {
+        setStatus("Aún procesando…");
+        return;
+      }
+      // puede haber silencio inicial (intro) si startOut < pad
+      const srcStartF = (startOut - pad) * sr;
+      const dstSkip = Math.max(0, Math.round(-srcStartF));
+      const srcStart = Math.max(0, Math.round(srcStartF));
+      const channels: Float32Array[] = [];
+      for (let c = 0; c < sb.numberOfChannels; c++) {
+        const src = sb.getChannelData(c);
+        const dst = new Float32Array(lengthSamples);
+        const avail = Math.max(0, src.length - srcStart);
+        const n = Math.min(lengthSamples - dstSkip, avail);
+        if (n > 0) dst.set(src.subarray(srcStart, srcStart + n), dstSkip);
+        channels.push(dst);
       }
 
       const m = maxAbs(channels);
       if (m > 0.999) setClipWarn(m);
 
-      const blob = encodeWav(channels, sr, bitDepth);
+      const blob = encodeWav(
+        channels,
+        sr,
+        bitDepth,
+        embedTempo
+          ? { bpm: projectBPM, beats: exportPlan.barCount * beatsPerBar, beatsPerBar }
+          : undefined
+      );
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
@@ -558,7 +548,7 @@ export default function App() {
     } finally {
       setExportBusy(false);
     }
-  }, [file, exportPlan, factor, keepPitch, pad, bitDepth]);
+  }, [file, exportPlan, pad, bitDepth, embedTempo, projectBPM, beatsPerBar]);
 
   /* ---------- render ---------- */
 
@@ -684,7 +674,7 @@ export default function App() {
                       BPM (auto):
                     </span>
                     <W95Field>
-                      {detected.bpm.toFixed(1)} (conf. {Math.round(detected.conf * 100)}%)
+                      {detected.bpm.toFixed(2)} (conf. {Math.round(detected.conf * 100)}%)
                     </W95Field>
                   </div>
                 </>
@@ -902,16 +892,26 @@ export default function App() {
 
             <div>
               <div className="w95-group-title">Procesado</div>
-              <W95Checkbox
-                checked={keepPitch}
-                onChange={setKeepPitch}
-                label="Mantener tono"
-              />
-              {!keepPitch && (
-                <div className="w95-label" style={{ color: "#404040" }}>
-                  Desactivado: cambia el tono como un vinilo.
-                </div>
-              )}
+              <div className="flex items-center gap-2" style={{ margin: "2px 0" }}>
+                <span className="w95-label">Algoritmo:</span>
+                <W95Select
+                  value={method}
+                  onChange={(v) => setMethod(v as StretchMethod)}
+                  options={[
+                    { value: "wsola", label: "Rítmico (conserva la onda)" },
+                    { value: "pvoc", label: "Tonal (vocoder de fase)" },
+                    { value: "resample", label: "Remuestreo (cambia el tono)" },
+                  ]}
+                />
+              </div>
+              <div className="w95-label" style={{ color: "#404040", marginBottom: 2 }}>
+                {method === "wsola" &&
+                  "Copia fragmentos reales de la onda y ancla los golpes: ideal para percusión y loops."}
+                {method === "pvoc" &&
+                  "Reconstruye el audio con fases: mejor para pads, cuerdas y voces sostenidas."}
+                {method === "resample" &&
+                  "No deforma la onda en absoluto, pero sube/baja el tono como un vinilo."}
+              </div>
               <W95Checkbox
                 checked={metronomeOn}
                 onChange={setMetronomeOn}
@@ -954,6 +954,11 @@ export default function App() {
                   />
                 </div>
               )}
+              <W95Checkbox
+                checked={embedTempo}
+                onChange={setEmbedTempo}
+                label="Incrustar tempo en el WAV (chunk ACID)"
+              />
               <div className="flex items-center gap-2 mt-1">
                 <span className="w95-label">Formato:</span>
                 <W95Select
@@ -1120,7 +1125,7 @@ export default function App() {
                 Carga un audio, coloca el marcador en el primer golpe real,
                 ajústalo al tempo de tu proyecto y descárgalo sincronizado.
               </div>
-              <div className="w95-label">· Vocoder de fase con preservación de transitorios</div>
+              <div className="w95-label">· Estirado en un Web Worker: tres algoritmos, golpes anclados al compás</div>
               <div className="w95-label">· Estéreo intacto, misma frecuencia de muestreo</div>
               <div className="w95-label">· Sin normalizar, sin comprimir, sin efectos</div>
               <div className="w95-label">· WAV 24 bits o 32 flotante, duración exacta en compases</div>
@@ -1141,7 +1146,7 @@ export default function App() {
           </div>
           <div className="w95-status-panel mono" style={{ flex: "0 0 auto" }}>
             {file
-              ? `Proyecto: ${Math.round(projectBPM)} BPM · Original: ${originalBPM.toFixed(1)} BPM · ${beatsPerBar}/${beatsPerBar === 6 ? 8 : 4}`
+              ? `Proyecto: ${Math.round(projectBPM)} BPM · Original: ${originalBPM.toFixed(2)} BPM · ${beatsPerBar}/${beatsPerBar === 6 ? 8 : 4}`
               : "Sin audio"}
           </div>
           <div className="w95-status-panel" style={{ flex: "0 0 auto", minWidth: 190 }}>

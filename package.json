@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:dsp": "esbuild tests/dsp.test.ts --bundle --platform=node --format=esm --outfile=.tmp/dsp.mjs --log-level=error && node .tmp/dsp.mjs"
   },
   "dependencies": {
     "clsx": "2.1.1",

@@ -250,3 +250,93 @@ export function detectBpmFrom(env: OnsetEnvelope, fromSec: number): BpmResult {
 
   return { bpm: Math.round(bpm * 10) / 10, confidence, stable };
 }
+
+/* ---------- refinado fino (resolución de ~1,5 ms) ---------- */
+
+const FINE_B = 64;
+
+// Fuerza de ataque: derivada positiva de la amplitud RMS por bloques de 64 muestras.
+function fineOnsetEnv(x: Float32Array): Float32Array {
+  const nb = Math.floor(x.length / FINE_B);
+  const env = new Float32Array(nb);
+  let prev = 0;
+  for (let b = 0; b < nb; b++) {
+    let s = 0;
+    for (let i = b * FINE_B; i < (b + 1) * FINE_B; i++) s += x[i] * x[i];
+    const a = Math.sqrt(s / FINE_B);
+    env[b] = Math.max(0, a - prev);
+    prev = a;
+  }
+  return env;
+}
+
+// Ajusta el primer golpe al inicio real del ataque (±40 ms alrededor de la detección gruesa).
+export function refineFirstBeat(x: Float32Array, sr: number, approxSec: number): number {
+  const env = fineOnsetEnv(x);
+  const c = Math.floor((approxSec * sr) / FINE_B);
+  const r = Math.floor((0.04 * sr) / FINE_B);
+  const lo = Math.max(0, c - r);
+  const hi = Math.min(env.length - 1, c + r);
+  let mx = 0;
+  for (let b = lo; b <= hi; b++) if (env[b] > mx) mx = env[b];
+  if (mx <= 0) return approxSec;
+  for (let b = lo; b <= hi; b++) {
+    if (env[b] >= 0.25 * mx) return (b * FINE_B) / sr;
+  }
+  return approxSec;
+}
+
+// Ajusta el BPM probando una rejilla de pulsos anclada en el primer golpe:
+// la rejilla correcta es la que acumula más energía de ataque. Resolución ~0,005 BPM.
+export function refineBpm(x: Float32Array, sr: number, firstBeatSec: number, bpm0: number): number {
+  const env = fineOnsetEnv(x);
+  const sm = new Float32Array(env.length);
+  for (let b = 0; b < env.length; b++) {
+    sm[b] = (env[Math.max(0, b - 1)] + 2 * env[b] + env[Math.min(env.length - 1, b + 1)]) / 4;
+  }
+  const first = (firstBeatSec * sr) / FINE_B;
+  const spanBlocks = Math.min(env.length - first - 2, (45 * sr) / FINE_B);
+  const beatBlocks0 = (60 / bpm0) * (sr / FINE_B);
+  const K = Math.floor(spanBlocks / beatBlocks0);
+  if (K < 6) return bpm0;
+
+  const at = (t: number) => {
+    const i = Math.floor(t);
+    const f = t - i;
+    return sm[i] * (1 - f) + sm[i + 1] * f;
+  };
+  const score = (bpm: number) => {
+    const bb = (60 / bpm) * (sr / FINE_B);
+    let s = 0;
+    for (let k = 0; k <= K; k++) {
+      const t = first + k * bb;
+      if (t >= sm.length - 2) break;
+      s += at(t);
+    }
+    return s;
+  };
+
+  const step = 0.005;
+  const n = Math.round((bpm0 * 0.02) / step);
+  let best = bpm0;
+  let bestS = -1;
+  const scores: number[] = [];
+  for (let i = -n; i <= n; i++) {
+    const s = score(bpm0 + i * step);
+    scores.push(s);
+    if (s > bestS) {
+      bestS = s;
+      best = bpm0 + i * step;
+    }
+  }
+  // interpolación parabólica del pico
+  const bi = Math.round((best - bpm0) / step) + n;
+  if (bi > 0 && bi < scores.length - 1) {
+    const y0 = scores[bi - 1];
+    const y1 = scores[bi];
+    const y2 = scores[bi + 1];
+    const d = y0 - 2 * y1 + y2;
+    if (Math.abs(d) > 1e-12) best += (0.5 * (y0 - y2) / d) * step;
+  }
+  return best;
+}
